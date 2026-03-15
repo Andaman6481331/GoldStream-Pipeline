@@ -1,0 +1,6 @@
+asyncpg
+pydantic
+pandas
+python-dotenv
+ta
+psycopg2-binary

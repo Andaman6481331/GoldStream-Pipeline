@@ -1,0 +1,26 @@
+# virtual environment
+.venv/
+
+# environment variables (never commit passwords)
+.env
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# pytest cache
+.pytest_cache/
+
+# docker volumes (auto generated)
+postgres_data/
+
+# VS Code settings
+.vscode/
+
+# windows garbage
+Thumbs.db
+desktop.ini
+
+# logs
+*.log
