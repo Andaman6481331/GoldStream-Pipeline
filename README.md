@@ -17,4 +17,53 @@ This project focuses on the infrastructure and flow of data rather than just the
 
 # Out-of-Scope:
 * Developing complex machine learning models (this is handled in the "Gold" or downstream analytics layer).
-* Direct integration with live brokerage accounts for real-money execution (currently focused on MT5 backtest/demo feeds). 
+* Direct integration with live brokerage accounts for real-money execution (currently focused on MT5 backtest/demo feeds).
+
+## 🚀 How to Run the Project
+
+### 1. Requirements
+
+Ensure you have the following installed on your system:
+- **Python 3.8+**
+- **Docker** and **Docker Compose**
+
+### 2. Create and Activate a Virtual Environment
+
+First, create a virtual environment to manage your Python dependencies.
+
+**On Windows:**
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+**On macOS / Linux:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 3. Install Dependencies
+
+With your virtual environment active, install the required Python packages:
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Start Infrastructure (Docker)
+
+Start the required infrastructure (PostgreSQL database and Adminer for database management) using Docker Compose:
+
+```bash
+docker-compose up -d postgres adminer
+```
+*Note: Make sure Docker Desktop is running before executing this command.*
+
+### 5. Run the Application
+
+Once the database is up and running, you can start the main Python pipeline:
+
+```bash
+python main.py
+```
