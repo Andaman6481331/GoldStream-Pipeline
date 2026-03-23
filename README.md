@@ -67,3 +67,25 @@ Once the database is up and running, you can start the main Python pipeline:
 ```bash
 python main.py
 ```
+
+### 📈 Historical Feed & Backtesting (New)
+
+The pipeline now supports high-performance historical analysis and event-based backtesting.
+
+#### 1. Ingest Historical Data
+Download tick data from Dukascopy into the DuckDB Gold layer (Feature Store):
+```bash
+python ingest_history.py --symbol XAUUSD --start 2024-01-01 --end 2024-01-07
+```
+
+#### 2. Run a Backtest
+Simulate a strategy using the event-loop engine:
+```bash
+python example_backtest.py
+```
+
+#### 🏗️ Architecture Extensions
+- **Bronze Layer**: Partitioned Parquet (Local Files)
+- **Silver Layer**: Unified Pydantic Schema model
+- **Gold Layer**: DuckDB Feature Store with RSI & ATR (5-min resampled)
+- **Backtesting**: Tick-by-tick simulation with Trailing Stops and Liquidity Gap detection.

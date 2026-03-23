@@ -4,3 +4,8 @@ pandas
 python-dotenv
 ta
 psycopg2-binary
+# Historical pipeline dependencies
+aiohttp
+aiofiles
+pyarrow
+duckdb
