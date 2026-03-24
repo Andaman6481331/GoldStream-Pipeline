@@ -24,3 +24,8 @@ desktop.ini
 
 # logs
 *.log
+# heavyweight data (Parquet + DuckDB)
+data/
+*.duckdb
+*.duckdb.wal
+*.parquet

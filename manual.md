@@ -61,3 +61,4 @@ The library provides an **Event-Based Backtest Engine**.
 - **Ingest History**: `python ingest_history.py --start 2024-01-01 --end 2024-01-31`
 - **Run Simulator**: `python example_backtest.py`
 - **Check DB**: `SELECT count(*) FROM tick_features`
+- **Check Parquet**: `python -c "import duckdb; print(duckdb.query(\"SELECT count(*) FROM 'data/bronze/XAUUSD/year=2023/month=2/ticks.parquet'\").fetchone())"`
