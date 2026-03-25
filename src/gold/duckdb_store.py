@@ -52,6 +52,7 @@ class DuckDBStore:
                 bid             DOUBLE      NOT NULL,
                 ask             DOUBLE      NOT NULL,
                 volume          DOUBLE,
+                volume_usd      DOUBLE,
                 source          VARCHAR,
                 PRIMARY KEY (timestamp_utc, symbol, source)
             )
@@ -64,6 +65,7 @@ class DuckDBStore:
                 bid             DOUBLE,
                 ask             DOUBLE,
                 volume          DOUBLE,
+                volume_usd      DOUBLE,
                 source          VARCHAR,
                 -- OHLC candle fields (aligned to 5-min bar)
                 bar_open    DOUBLE,
@@ -76,6 +78,14 @@ class DuckDBStore:
                 -- Liquidity
                 liq_level   DOUBLE,
                 liq_type    VARCHAR,   -- 'swing_high' | 'swing_low' | 'round_number'
+                liq_side    VARCHAR,
+                liq_tf      VARCHAR,
+                liq_score   DOUBLE,
+                liq_confirmed BOOLEAN,
+                liq_swept     BOOLEAN,
+                dist_to_nearest_high DOUBLE,
+                dist_to_nearest_low  DOUBLE,
+                session     VARCHAR,
                 PRIMARY KEY (timestamp_utc, symbol, source)
             )
         """)
@@ -84,7 +94,31 @@ class DuckDBStore:
             CREATE INDEX IF NOT EXISTS idx_features_symbol_time
             ON tick_features (symbol, timestamp_utc)
         """)
+        self._migrate_schema()
         logger.info("[DuckDBStore] Schema initialised")
+
+    def _migrate_schema(self) -> None:
+        """Add missing columns to existing tables if needed."""
+        # unified_ticks migrations
+        self._add_column_if_not_exists("unified_ticks", "volume_usd", "DOUBLE")
+        
+        # tick_features migrations
+        self._add_column_if_not_exists("tick_features", "volume_usd", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "liq_side", "VARCHAR")
+        self._add_column_if_not_exists("tick_features", "liq_tf", "VARCHAR")
+        self._add_column_if_not_exists("tick_features", "liq_score", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "liq_confirmed", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "liq_swept", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "dist_to_nearest_high", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "dist_to_nearest_low", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "session", "VARCHAR")
+
+    def _add_column_if_not_exists(self, table: str, column: str, dtype: str) -> None:
+        """Helper to safely add a column to an existing table."""
+        try:
+            self._con.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {dtype}")
+        except Exception as exc:
+            logger.error(f"[DuckDBStore] Failed to migrate {table}.{column}: {exc}")
 
     # ── Writes ────────────────────────────────────────────────────────────────
 
@@ -103,8 +137,11 @@ class DuckDBStore:
             df = pd.DataFrame(rows)
             df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
             self._con.execute("""
-                INSERT OR IGNORE INTO unified_ticks
-                SELECT * FROM df
+                INSERT OR IGNORE INTO unified_ticks 
+                    (timestamp_utc, symbol, bid, ask, volume, volume_usd, source)
+                SELECT 
+                    timestamp_utc, symbol, bid, ask, volume, volume_usd, source
+                FROM df
             """)
             total += len(rows)
 
@@ -129,8 +166,22 @@ class DuckDBStore:
         if df.empty:
             return
         # DELETE + INSERT pattern (DuckDB doesn't have native UPSERT for all cases)
-        self._con.execute("DELETE FROM tick_features WHERE symbol = ?", [df["symbol"].iloc[0]])
-        self._con.execute("INSERT INTO tick_features SELECT * FROM df")
+        cols = [
+            "timestamp_utc", "symbol", "bid", "ask", "volume", "volume_usd", "source",
+            "bar_open", "bar_high", "bar_low", "bar_close",
+            "rsi_14", "atr_14",
+            "liq_level", "liq_type", "liq_side", "liq_tf",
+            "liq_score", "liq_confirmed", "liq_swept",
+            "dist_to_nearest_high", "dist_to_nearest_low",
+            "session"
+        ]
+        # Only use columns that exist in the DataFrame
+        available = [c for c in cols if c in df.columns]
+        col_names = ", ".join(available)
+        placeholders = ", ".join([f"{c}" for c in available])
+        
+        self._con.execute(f"DELETE FROM tick_features WHERE symbol = ?", [df["symbol"].iloc[0]])
+        self._con.execute(f"INSERT INTO tick_features ({col_names}) SELECT {col_names} FROM df")
         logger.info(f"[DuckDBStore] Upserted {len(df)} rows into tick_features")
 
     # ── Queries ───────────────────────────────────────────────────────────────

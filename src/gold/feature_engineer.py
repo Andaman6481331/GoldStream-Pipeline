@@ -134,7 +134,7 @@ class FeatureEngineer:
             logger.warning("[FeatureEngineer] Nothing to save — DataFrame is empty")
             return
         cols = [
-            "timestamp_utc", "symbol", "bid", "ask", "volume", "source",
+            "timestamp_utc", "symbol", "bid", "ask", "volume", "volume_usd", "source",
             "bar_open", "bar_high", "bar_low", "bar_close",
             "rsi_14", "atr_14",
             "liq_level", "liq_type", "liq_side", "liq_tf",
