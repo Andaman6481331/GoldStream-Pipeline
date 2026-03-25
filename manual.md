@@ -57,6 +57,13 @@ The library provides an **Event-Based Backtest Engine**.
 
 ---
 
+## Visualize Data
+```bash
+duckdb -ui data/gold/goldstream.duckdb
+```
+
+---
+
 ## ⚡ Quick Commands
 - **Ingest History**: `python ingest_history.py --start 2024-01-01 --end 2024-01-31`
 - **Run Simulator**: `python example_backtest.py`
