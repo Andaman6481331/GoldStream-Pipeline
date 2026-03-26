@@ -23,7 +23,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 import pandas as pd
 
-from src.bot.strategy import make_decision, build_context_from_row, Action
+
 
 if TYPE_CHECKING:
     from src.gold.duckdb_store import DuckDBStore
@@ -37,6 +37,12 @@ class Position(Enum):
     FLAT  = "FLAT"
     LONG  = "LONG"
     SHORT = "SHORT"
+
+class Action(Enum):
+    HOLD       = "HOLD"
+    OPEN_LONG  = "OPEN_LONG"
+    OPEN_SHORT = "OPEN_SHORT"
+    CLOSE      = "CLOSE"
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -261,6 +267,7 @@ class BacktestEngine:
                 self._update_trailing_stop(state, bid, ask)
 
             # ── Strategy decision ─────────────────────────────────────────
+            from src.bot.strategy_scout_sniper import build_context_from_row, make_decision
             ctx    = build_context_from_row(row_dict)
             action = make_decision(ctx)
 

@@ -16,32 +16,33 @@ The system collects raw data from two sources:
 ### Step 2: Validation & Normalization (Silver Layer)
 Raw data from different sources is often "dirty" or inconsistently formatted.
 - **Logic**: Uses **Pydantic Models** to enforce strict data types (e.g., prices must be positive, timestamps must be valid).
-- **Transformation**: Normalizes disparate fields into a single `UnifiedTick` schema (Source, Timestamp, Symbol, Bid, Ask, Volume).
+- **Transformation**: Normalizes disparate fields into a single `UnifiedTick` schema.
 
 ### Step 3: Feature Engineering (Gold Layer)
-This is where the raw ticks become "intelligent."
-- **Resampling**: Ticks are grouped into **5-minute OHLC candles** (Open, High, Low, Close).
-- **Indicator Calculation**: Calculates **RSI (Momentum)** and **ATR (Volatility)** using the `ta` library.
-- **Liquidity Detection**: Identifies potential support/resistance "Gaps" (Spread-aware) and "Round Number" levels.
-- **Merge**: These 5-min features are mapped back to every single tick using a `merge_asof` logic.
+This is where the raw ticks become "intelligent" following **SMC (Smart Money Concepts)** rules.
+- **BOS/CHoCH Detection**: Automatically identifies market structure shifts.
+-  **Fair Value Gaps (FVG)**: Identifies 3-candle price imbalances and tracks if they are "filled" or "mitigated".
+- **Indicator Calculation**: RSI (Momentum) and ATR (Volatility).
+- **Session Labelling**: Tags every tick as `london`, `new_york`, `asian`, or the `killzone` window.
 
 ### Step 4: Storage (DuckDB Feature Store)
 Processed "Gold" data is stored in **DuckDB**, a high-performance local columnar database.
-- **Why?**: DuckDB allows you to run complex SQL queries over millions of ticks in milliseconds, making it ideal for quantitative research.
+- **Why?**: DuckDB allows unified SQL access to both live and historical features with millisecond latency.
+- **Persistence**: All decisions made by the strategy are also recorded in the `trade_decisions` table for audit.
 
-### Step 5: Backtesting (Application Layer)
-The library provides an **Event-Based Backtest Engine**.
-- **Process**: The engine "replays" the ticks from DuckDB one by one.
-- **Callbacks**: Your strategy receives a `TickEvent` (Price + Indicators) and returns an `Action` (Buy/Sell/Close).
-- **Execution**: The engine handles trailing stops, spread-cost calculation, and liquidity gap force-closes.
+### Step 5: Backtesting & Strategy (Application Layer)
+The system runs the **Scout & Sniper** execution engine.
+- **Scout Phase**: Monitors for a structure break (BOS) indicating a new trend.
+- **Sniper Phase**: Once a trend is confirmed, it waits for price to retrace into a fresh FVG (Fair Value Gap) before executing.
+- **Decision Persistence**: Every signal is saved to DuckDB with full context (RSI, ATR, FVG bounds).
 
 ---
 
 ## 🧠 Internal Logic Summary
 
-- **Medallion Architecture**: Data flows from Raw (Bronze) → Validated (Silver) → Enriched (Gold).
-- **Asynchronicity**: Uses `asyncio` for high-speed concurrent downloads and database I/O to handle thousands of ticks per second.
-- **Micro-Normalization**: Ensures that whether data comes from a live MT5 stream or a 10-year-old file, it looks identical to your trading strategy.
+- **Unified Logic**: Whether data is live or historical, it flows through the same `FeatureEngineer` and `Strategy` code.
+- **Asynchronicity**: Uses `asyncio` for high-speed concurrent downloads and database ops.
+- **Audit-Ready**: The DuckDB store acts as a single source of truth for both price data and trade signals.
 
 ---
 
@@ -49,23 +50,30 @@ The library provides an **Event-Based Backtest Engine**.
 
 | Category | Input / Source | Output / Result |
 | :--- | :--- | :--- |
-| **Ingestion** | MT5 Python API & Dukascopy CDN (.bi5) | Partitioned Parquet (Year/Month) |
+| **Ingestion** | MT5 Python API & Dukascopy CDN | Partitioned Parquet (Year/Month) |
 | **Validation** | Pydantic Schemas | Cleaned, Unified Dataframes |
-| **Analytics** | Tick Mid-prices | RSI(14), ATR(14), Swing Highs/Lows |
-| **Storage** | Local Memory / Parquet Files | `data/gold/goldstream.duckdb` (SQL-Ready) |
-| **Backtest** | User Strategy Function | PnL Logs, Win-Rate, Max Drawdown |
+| **Gold Analytics** | Tick mid-prices | BOS, CHoCH, FVG, RSI, ATR |
+| **Storage** | Local Parquet / DuckDB | `goldstream.duckdb` (SQL-Ready) |
+| **Trade Audit** | Scout & Sniper Strategy | `trade_decisions` table |
 
 ---
 
-## Visualize Data
+## ⚡ SQL Audit Commands
+Use the DuckDB CLI to inspect your data:
 ```bash
+# Open DuckDB UI
 duckdb -ui data/gold/goldstream.duckdb
+
+# Check how many structural breaks were detected
+duckdb data/gold/goldstream.duckdb -s "SELECT session, count(*) FROM tick_features WHERE bos_detected = TRUE GROUP BY session"
+
+# View the latest trade signals
+duckdb data/gold/goldstream.duckdb -s "SELECT * FROM trade_decisions ORDER BY tick_time DESC LIMIT 10"
 ```
 
 ---
 
-## ⚡ Quick Commands
-- **Ingest History**: `python ingest_history.py --start 2024-01-01 --end 2024-01-31`
-- **Run Simulator**: `python example_backtest.py`
-- **Check DB**: `SELECT count(*) FROM tick_features`
-- **Check Parquet**: `python -c "import duckdb; print(duckdb.query(\"SELECT count(*) FROM 'data/bronze/XAUUSD/year=2023/month=2/ticks.parquet'\").fetchone())"`
+## ⚡ Quick Shell Commands
+- **Ingest & Audit History**: `python ingest_history.py --start 2024-03-01 --end 2024-03-07`
+- **Run Live Pipeline**: `python main.py`
+- **Check DB Ticks**: `python -c "import duckdb; print(duckdb.connect('data/gold/goldstream.duckdb', read_only=True).execute('SELECT COUNT(*) FROM tick_features').fetchone()[0])"`

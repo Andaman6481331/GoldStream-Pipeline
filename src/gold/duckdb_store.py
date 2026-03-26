@@ -58,12 +58,14 @@ class DuckDBStore:
             )
         """)
 
+        # ── Tick Features (Gold) ──────────────────────────────────────────────
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS tick_features (
                 timestamp_utc   TIMESTAMPTZ NOT NULL,
                 symbol          VARCHAR     NOT NULL,
                 bid             DOUBLE,
                 ask             DOUBLE,
+                mid             DOUBLE,
                 volume          DOUBLE,
                 volume_usd      DOUBLE,
                 source          VARCHAR,
@@ -86,7 +88,42 @@ class DuckDBStore:
                 dist_to_nearest_high DOUBLE,
                 dist_to_nearest_low  DOUBLE,
                 session     VARCHAR,
+
+                -- Market Structure & FVG Columns
+                structure_direction  VARCHAR,
+                bos_detected         BOOLEAN,
+                choch_detected       BOOLEAN,
+                fvg_high             DOUBLE,
+                fvg_low              DOUBLE,
+                fvg_side             VARCHAR,
+                fvg_filled           BOOLEAN,
+                fvg_age_bars         INTEGER,
+                price_position       VARCHAR,
+
                 PRIMARY KEY (timestamp_utc, symbol, source)
+            )
+        """)
+
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS trade_decisions (
+                symbol          VARCHAR     NOT NULL,
+                tick_time       TIMESTAMPTZ NOT NULL,
+                decision        VARCHAR     NOT NULL,
+                -- Context fields
+                mid             DOUBLE,
+                bid             DOUBLE,
+                ask             DOUBLE,
+                rsi_14          DOUBLE,
+                atr_14          DOUBLE,
+                structure_direction VARCHAR,
+                bos_detected    BOOLEAN,
+                choch_detected  BOOLEAN,
+                fvg_high        DOUBLE,
+                fvg_low         DOUBLE,
+                fvg_side        VARCHAR,
+                session         VARCHAR,
+                price_position  VARCHAR,
+                PRIMARY KEY (symbol, tick_time)
             )
         """)
 
@@ -103,6 +140,7 @@ class DuckDBStore:
         self._add_column_if_not_exists("unified_ticks", "volume_usd", "DOUBLE")
         
         # tick_features migrations
+        self._add_column_if_not_exists("tick_features", "mid", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "volume_usd", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "liq_side", "VARCHAR")
         self._add_column_if_not_exists("tick_features", "liq_tf", "VARCHAR")
@@ -112,6 +150,16 @@ class DuckDBStore:
         self._add_column_if_not_exists("tick_features", "dist_to_nearest_high", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "dist_to_nearest_low", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "session", "VARCHAR")
+
+        self._add_column_if_not_exists("tick_features", "structure_direction", "VARCHAR")
+        self._add_column_if_not_exists("tick_features", "bos_detected", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "choch_detected", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "fvg_high", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "fvg_side", "VARCHAR")
+        self._add_column_if_not_exists("tick_features", "fvg_timestamp", "TIMESTAMPTZ")
+        self._add_column_if_not_exists("tick_features", "fvg_filled", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "fvg_age_bars", "INTEGER")
+        self._add_column_if_not_exists("tick_features", "price_position", "VARCHAR")
 
     def _add_column_if_not_exists(self, table: str, column: str, dtype: str) -> None:
         """Helper to safely add a column to an existing table."""
@@ -167,13 +215,17 @@ class DuckDBStore:
             return
         # DELETE + INSERT pattern (DuckDB doesn't have native UPSERT for all cases)
         cols = [
-            "timestamp_utc", "symbol", "bid", "ask", "volume", "volume_usd", "source",
+            "timestamp_utc", "symbol", "bid", "ask", "mid", "volume", "volume_usd", "source",
             "bar_open", "bar_high", "bar_low", "bar_close",
             "rsi_14", "atr_14",
             "liq_level", "liq_type", "liq_side", "liq_tf",
             "liq_score", "liq_confirmed", "liq_swept",
             "dist_to_nearest_high", "dist_to_nearest_low",
-            "session"
+            "session",
+
+            "structure_direction", "bos_detected", "choch_detected",
+            "fvg_high", "fvg_low", "fvg_side", "fvg_timestamp", "fvg_filled",
+            "fvg_age_bars", "price_position"
         ]
         # Only use columns that exist in the DataFrame
         available = [c for c in cols if c in df.columns]
@@ -183,6 +235,27 @@ class DuckDBStore:
         self._con.execute(f"DELETE FROM tick_features WHERE symbol = ?", [df["symbol"].iloc[0]])
         self._con.execute(f"INSERT INTO tick_features ({col_names}) SELECT {col_names} FROM df")
         logger.info(f"[DuckDBStore] Upserted {len(df)} rows into tick_features")
+
+    def insert_trade_decision(self, decision_data: dict) -> None:
+        """Persist a single trade decision into the trade_decisions table."""
+        cols = [
+            "symbol", "tick_time", "decision", "mid", "bid", "ask",
+            "rsi_14", "atr_14", "structure_direction", "bos_detected",
+            "choch_detected", "fvg_high", "fvg_low", "fvg_side",
+            "session", "price_position"
+        ]
+        # Ensure tick_time is a datetime object for DuckDB
+        if isinstance(decision_data["tick_time"], str):
+             decision_data["tick_time"] = pd.to_datetime(decision_data["tick_time"])
+
+        col_names = ", ".join(cols)
+        placeholders = ", ".join(["?" for _ in cols])
+        values = [decision_data.get(c) for c in cols]
+
+        self._con.execute(f"""
+            INSERT OR IGNORE INTO trade_decisions ({col_names})
+            VALUES ({placeholders})
+        """, values)
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
@@ -221,6 +294,14 @@ class DuckDBStore:
     def get_tick_count(self, table: str = "unified_ticks") -> int:
         """Quick row count for a given table."""
         return self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def query_decisions(self, symbol: str) -> pd.DataFrame:
+        """Return all trade decisions for a symbol."""
+        return self._con.execute("""
+            SELECT * FROM trade_decisions 
+            WHERE symbol = ? 
+            ORDER BY tick_time ASC
+        """, [symbol]).df()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

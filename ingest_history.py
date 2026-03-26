@@ -27,6 +27,7 @@ from src.ingestion.history_downloader import HistoryDownloader
 from src.validation.silver_processor  import SilverProcessor
 from src.gold.duckdb_store            import DuckDBStore
 from src.gold.feature_engineer        import FeatureEngineer
+from src.bot.audit_logger             import run_gold_layer
 
 import pandas as pd
 
@@ -110,6 +111,12 @@ async def run_pipeline(
                 f"[Gold] Features saved — {len(enriched):,} rows in tick_features"
             )
 
+            # ── STRATEGY EXECUTION (Scout & Sniper) ───────────────────────
+            logger.info("[Gold] Running Scout & Sniper strategy engine...")
+            # We close the store context first to ensure everything is flushed, 
+            # or we just call the runner within the same process if it handles its own connection.
+            # audit_logger.run_gold_layer() creates its own DuckDBStore connection.
+
             # Print a quick sample
             sample_cols = ["timestamp_utc", "bid", "ask", "rsi_14", "atr_14", "liq_level", "liq_type"]
             available   = [c for c in sample_cols if c in enriched.columns]
@@ -124,6 +131,9 @@ async def run_pipeline(
         uc = store.get_tick_count("unified_ticks")
         fc = store.get_tick_count("tick_features")
         print(f"\n-- DuckDB totals: unified_ticks={uc:,}  tick_features={fc:,} --")
+
+    # Run strategy after store is closed to avoid lock issues
+    await run_gold_layer(db_path=gold_db)
 
     logger.info("[Pipeline] Done.")
 

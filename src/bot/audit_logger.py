@@ -1,166 +1,115 @@
 """
-Gold Layer Runner
-Reads enriched tick_features rows (produced by FeatureEngineer v2),
-builds a full SMCContext per tick, calls make_decision, and persists
-the result to trade_decisions.
-
-Key fixes vs previous version:
-  - Reads from tick_features (not cleaned_ticks)
-  - Pre-filters at SQL level: confirmed, unswept, scored, session-gated
-  - Passes full SMCContext to make_decision (not just rsi/ema/bid)
-  - INSERT writes all relevant v2 columns to trade_decisions
-  - Logs decision reason fields for post-analysis
+Gold Layer Runner (DuckDB version)
+Reads enriched tick_features rows (produced by FeatureEngineer v3),
+builds a ScoutSniperContext per tick, calls make_decision, and persists
+the result to trade_decisions in DuckDB.
 """
 
-import asyncpg
-import asyncio
-import os
 import logging
+import os
+import pandas as pd
 from dotenv import load_dotenv
 
-from src.bot.strategy import make_decision, build_context_from_row, SMCContext
-from src.backtesting.backtest_engine import Action
+from src.bot.strategy_scout_sniper import make_decision, build_context_from_row, ScoutSniperContext
+from src.backtest.backtest_engine import Action
+from src.gold.duckdb_store import DuckDBStore
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-
-# ── DB connection ─────────────────────────────────────────────────────────────
-
-async def get_db_connection() -> asyncpg.Connection:
-    return await asyncpg.connect(
-        host=os.getenv("DB_HOST"),
-        port=int(os.getenv("DB_PORT")),
-        database=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-    )
-
-
-# ── Main runner ───────────────────────────────────────────────────────────────
-
-async def run_gold_layer() -> None:
-    conn = await get_db_connection()
-    logger.info("Gold layer runner starting...")
+async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
+    """
+    Main runner for the Gold layer using DuckDB.
+    1. Connects to DuckDB.
+    2. Queries unprocessed ticks from tick_features.
+    3. Runs Scout & Sniper strategy.
+    4. Persists OPEN_LONG / OPEN_SHORT decisions.
+    """
+    logger.info(f"Gold layer runner (DuckDB) starting with {db_path}...")
 
     try:
-        # ── Pull only ticks that are worth evaluating ─────────────────────
-        # Pre-filter at DB level to avoid loading noise into Python.
-        # liq_confirmed / liq_swept / liq_score filter here means
-        # make_decision's gate checks are a safety net, not the first line.
-        rows = await conn.fetch("""
-            SELECT f.*
-            FROM tick_features f
-            LEFT JOIN trade_decisions t
-                ON f.timestamp_utc = t.tick_time
-                AND f.symbol = t.symbol
-            WHERE t.tick_time IS NULL              -- not yet processed
-              AND f.liq_confirmed = TRUE           -- structure break proven
-              AND f.liq_swept     = FALSE          -- level not yet consumed
-              AND f.liq_score     >= 4             -- meaningful confluence
-              AND f.session IN ('killzone', 'london')
-              AND f.rsi_14  IS NOT NULL
-              AND f.atr_14  IS NOT NULL
-            ORDER BY f.timestamp_utc ASC
-            LIMIT 500
-        """)
+        with DuckDBStore(db_path=db_path) as store:
+            # ── Pull only ticks that are worth evaluating ─────────────────────
+            # We look for ticks in tick_features that don't have a decision yet.
+            query = """
+                SELECT f.*
+                FROM tick_features f
+                LEFT JOIN trade_decisions t
+                    ON f.timestamp_utc = t.tick_time
+                    AND f.symbol = t.symbol
+                WHERE t.tick_time IS NULL              -- not yet processed
+                  AND f.rsi_14 IS NOT NULL             -- health check
+                  AND (f.bos_detected = TRUE OR f.choch_detected = TRUE) -- structure trigger
+                ORDER BY f.timestamp_utc ASC
+                LIMIT 1000
+            """
+            rows_df = store._con.execute(query).df()
+            
+            if rows_df.empty:
+                logger.debug("No qualifying ticks (with structure breaks) to process")
+                return
 
-        if not rows:
-            logger.info("No qualifying ticks to process")
-            return
+            logger.info(f"Processing {len(rows_df)} qualifying ticks...")
 
-        logger.info(f"Processing {len(rows)} qualifying ticks...")
+            saved = 0
+            skipped = 0
 
-        saved = 0
-        skipped = 0
+            for _, row_series in rows_df.iterrows():
+                row = row_series.to_dict()
+                # Build context
+                ctx: ScoutSniperContext = build_context_from_row(row)
 
-        for row in rows:
-            # Build full SMC context from the row
-            ctx: SMCContext = build_context_from_row(dict(row))
+                # Get decision
+                action: Action = make_decision(ctx)
+                decision_str = action.value
 
-            # Get decision
-            action: Action = make_decision(ctx)
-            decision_str = action.value   # "OPEN_LONG" | "OPEN_SHORT" | "HOLD"
+                # Skip HOLDs
+                if action == Action.HOLD:
+                    skipped += 1
+                    continue
 
-            # Skip HOLDs — no point storing non-events
-            if action == Action.HOLD:
-                skipped += 1
-                continue
+                # Prepare decision record
+                decision_record = {
+                    "symbol": row["symbol"],
+                    "tick_time": row["timestamp_utc"],
+                    "decision": decision_str,
+                    "mid": ctx.mid,
+                    "bid": ctx.bid,
+                    "ask": ctx.ask,
+                    "rsi_14": ctx.rsi_14,
+                    "atr_14": ctx.atr_14,
+                    "structure_direction": ctx.structure_direction,
+                    "bos_detected": ctx.bos_detected,
+                    "choch_detected": ctx.choch_detected,
+                    "fvg_high": ctx.fvg_high,
+                    "fvg_low": ctx.fvg_low,
+                    "fvg_side": ctx.fvg_side,
+                    "session": ctx.session,
+                    "price_position": ctx.price_position,
+                }
 
-            # Persist the decision with full context for post-analysis
-            await conn.execute("""
-                INSERT INTO trade_decisions (
-                    symbol,
-                    tick_time,
-                    decision,
-                    bid,
-                    ask,
-                    spread,
-                    mid,
-                    rsi_14,
-                    atr_14,
-                    liq_level,
-                    liq_type,
-                    liq_side,
-                    liq_score,
-                    liq_confirmed,
-                    liq_swept,
-                    dist_to_nearest_high,
-                    dist_to_nearest_low,
-                    session,
-                    price_position,
-                    bar_close
-                ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-                    $11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+                # Persist to DuckDB
+                store.insert_trade_decision(decision_record)
+                saved += 1
+
+                logger.info(
+                    f"🎯 {decision_str:10s} | "
+                    f"BID={ctx.bid:.5f} | "
+                    f"Structure={ctx.structure_direction} | "
+                    f"FVG Side={ctx.fvg_side} | "
+                    f"Session={ctx.session}"
                 )
-                ON CONFLICT (symbol, tick_time) DO NOTHING
-            """,
-                row["symbol"],
-                row["timestamp_utc"],
-                decision_str,
-                ctx.bid,
-                ctx.ask,
-                ctx.spread,
-                ctx.mid,
-                ctx.rsi_14,
-                ctx.atr_14,
-                ctx.liq_level,
-                ctx.liq_type,
-                ctx.liq_side,
-                ctx.liq_score,
-                ctx.liq_confirmed,
-                ctx.liq_swept,
-                ctx.dist_to_nearest_high,
-                ctx.dist_to_nearest_low,
-                ctx.session,
-                ctx.price_position,
-                ctx.bar_close,
-            )
 
-            saved += 1
             logger.info(
-                f"{decision_str:10s} | "
-                f"BID={ctx.bid:.5f} | "
-                f"RSI={ctx.rsi_14:.1f} | "
-                f"Score={ctx.liq_score:.1f} | "
-                f"Session={ctx.session} | "
-                f"Position={ctx.price_position} | "
-                f"Side={ctx.liq_side}"
+                f"Gold layer complete — "
+                f"{saved} decisions saved, {skipped} HOLDs skipped"
             )
-
-        logger.info(
-            f"Gold layer complete — "
-            f"{saved} decisions saved, {skipped} HOLDs skipped"
-        )
 
     except Exception as exc:
         logger.error(f"Gold layer runner error: {exc}", exc_info=True)
         raise
-    finally:
-        await conn.close()
-
 
 if __name__ == "__main__":
+    import asyncio
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(run_gold_layer())

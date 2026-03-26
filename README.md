@@ -1,91 +1,57 @@
 ### GoldStream-Pipeline
-Near Real-Time data engineering pipeline designed to ingest, validate, and store high-frequency XAUUSD (Gold) market data from MetaTrader 5. Unlike a standard trading script, this system focuses on data reliability, integrity, and scalability, following industry-standard patterns such as the Medallion Architecture (Bronze, Silver, and Gold layers).
+Unified Data Engineering & Algorithmic Trading Infrastructure for **XAUUSD (Gold)**. 
+
+This project implements a professional **Medallion Architecture** (Bronze, Silver, Gold) to transform raw, high-frequency tick data into a production-ready feature store for institutional-grade strategies like **Scout & Sniper**.
 
 ## 🎯 Project Objective
-The primary goal is to engineer a robust infrastructure that converts raw, unpredictable financial data into a "production-ready" dataset for automated trading and analysis. Key objectives include:
-* Real-time Ingestion: Implementing an asynchronous Python-based collector for low-latency tick data.
-* Data Integrity: Automating data quality checks and validation using Pydantic to prevent "dirty" data from entering the database.
-* Scalable Storage: Architecting a containerized PostgreSQL database (optimized for time-series data) to ensure long-term data persistence and accessibility.
+The goal is to engineer a robust, low-latency pipeline that ensures data integrity and high-performance querying:
+* **Storage**: DuckDB-based columnar storage for millisecond-speed research over millions of ticks.
+* **Integrity**: Strict Pydantic-based validation at the Silver layer.
+* **Intelligence**: Feature-rich Gold layer including Market Structure (BOS/CHoCH) and Fairness Value Gaps (FVG).
 
-## 🔭 Project Scope
-This project focuses on the infrastructure and flow of data rather than just the final trading outcome. 
+## 🚀 Key Features
+* **Unified Pipeline**: The same logic drives both **Live Trading** (`main.py`) and **Historical Backtesting** (`ingest_history.py`).
+* **Scout & Sniper Strategy**: Advanced Smart Money Concepts (SMC) engine that detects structural breaks and executes precision entries into unfilled FVGs.
+* **Hybrid Storage**: Bronze layer in partitioned Parquet files; Gold layer in a high-performance DuckDB feature store.
 
-# In-Scope:
-* Development of a multi-stage ETL/ELT pipeline.
-* Containerization of the entire stack using Docker for consistent deployment.
-* Implementation of automated logging and monitoring for system health.
-
-# Out-of-Scope:
-* Developing complex machine learning models (this is handled in the "Gold" or downstream analytics layer).
-* Direct integration with live brokerage accounts for real-money execution (currently focused on MT5 backtest/demo feeds).
-
-## 🚀 How to Run the Project
+## 🛠️ How to Run the Project
 
 ### 1. Requirements
+* **Python 3.11+**
+* **DuckDB CLI** (optional, for manual SQL audits)
 
-Ensure you have the following installed on your system:
-- **Python 3.8+**
-- **Docker** and **Docker Compose**
-
-### 2. Create and Activate a Virtual Environment
-
-First, create a virtual environment to manage your Python dependencies.
-
-**On Windows:**
+### 2. Setup environment
 ```bash
 python -m venv .venv
+# Windows:
 .venv\Scripts\activate
-```
-
-**On macOS / Linux:**
-```bash
-python3 -m venv .venv
+# Linux/Mac:
 source .venv/bin/activate
-```
 
-### 3. Install Dependencies
-
-With your virtual environment active, install the required Python packages:
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 4. Start Infrastructure (Docker)
-
-Start the required infrastructure (PostgreSQL database and Adminer for database management) using Docker Compose:
-
+### 3. Run Historical Ingestion & Strategy Audit
+Download historical data and automatically run the strategy engine over it:
 ```bash
-docker-compose up -d postgres adminer
+python ingest_history.py --symbol XAUUSD --start 2024-03-01 --end 2024-03-08
 ```
-*Note: Make sure Docker Desktop is running before executing this command.*
 
-### 5. Run the Application
-
-Once the database is up and running, you can start the main Python pipeline:
-
+### 4. Run Live Trading Pipeline
+Stream real-time data from MT5 directly into the DuckDB Gold layer:
 ```bash
 python main.py
 ```
 
-### 📈 Historical Feed & Backtesting (New)
+### 📈 Historical Analytics & Backtesting
+The system provides a tick-by-tick event-loop engine for full simulation.
+* **Check Strategy Decisions**:
+  ```bash
+  duckdb data/gold/goldstream.duckdb -s "SELECT * FROM trade_decisions LIMIT 10"
+  ```
 
-The pipeline now supports high-performance historical analysis and event-based backtesting.
-
-#### 1. Ingest Historical Data
-Download tick data from Dukascopy into the DuckDB Gold layer (Feature Store):
-```bash
-python ingest_history.py --symbol XAUUSD --start 2024-01-01 --end 2024-01-07
-```
-
-#### 2. Run a Backtest
-Simulate a strategy using the event-loop engine:
-```bash
-python example_backtest.py
-```
-
-#### 🏗️ Architecture Extensions
-- **Bronze Layer**: Partitioned Parquet (Local Files)
-- **Silver Layer**: Unified Pydantic Schema model
-- **Gold Layer**: DuckDB Feature Store with RSI & ATR (5-min resampled)
-- **Backtesting**: Tick-by-tick simulation with Trailing Stops and Liquidity Gap detection.
+#### 🏗️ Medallion Architecture
+- **Bronze**: Local raw partitioned Parquet (Source-specific).
+- **Silver**: Normalized, validated Pydantic models.
+- **Gold**: DuckDB Feature Store with RSI, ATR, BOS, CHoCH, and FVG detection.
+- **Backtesting**: Tick-by-tick results with spread simulation and trailing stops.
