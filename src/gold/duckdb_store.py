@@ -96,9 +96,34 @@ class DuckDBStore:
                 fvg_high             DOUBLE,
                 fvg_low              DOUBLE,
                 fvg_side             VARCHAR,
+                fvg_timestamp        TIMESTAMPTZ,
                 fvg_filled           BOOLEAN,
                 fvg_age_bars         INTEGER,
                 price_position       VARCHAR,
+
+                -- NEW-P1: SMC ATR indicators
+                atr_20_1m            DOUBLE,
+                atr_15_15m           DOUBLE,
+                -- NEW-P1: Session levels
+                prev_day_high        DOUBLE,
+                prev_day_low         DOUBLE,
+                current_session_high DOUBLE,
+                current_session_low  DOUBLE,
+                prev_session_high    DOUBLE,
+                prev_session_low     DOUBLE,
+                session_boundary     BOOLEAN,
+                -- NEW-P1: Swing history counts
+                n_confirmed_swing_highs_15m INTEGER,
+                n_confirmed_swing_lows_15m  INTEGER,
+                -- Phase 2 SMC: Structural Nodes (15m)
+                smc_trend_15m        VARCHAR,
+                hh_15m               DOUBLE,
+                ll_15m               DOUBLE,
+                strong_low_15m       DOUBLE,
+                strong_high_15m      DOUBLE,
+                bos_detected_15m     BOOLEAN,
+                choch_detected_15m   BOOLEAN,
+                market_bias_4h       VARCHAR,
 
                 PRIMARY KEY (timestamp_utc, symbol, source)
             )
@@ -123,7 +148,30 @@ class DuckDBStore:
                 fvg_side        VARCHAR,
                 session         VARCHAR,
                 price_position  VARCHAR,
-                PRIMARY KEY (symbol, tick_time)
+                -- Phase 1 SMC Extended Context
+                atr_20_1m       DOUBLE,
+                atr_15_15m      DOUBLE,
+                prev_day_high   DOUBLE,
+                prev_day_low    DOUBLE,
+                current_session_high DOUBLE,
+                current_session_low  DOUBLE,
+                prev_session_high    DOUBLE,
+                prev_session_low     DOUBLE,
+                session_boundary     BOOLEAN,
+                n_confirmed_swing_highs_15m INTEGER,
+                n_confirmed_swing_lows_15m  INTEGER,
+                fvg_timestamp        TIMESTAMPTZ,
+                -- Phase 2 SMC: Structural Nodes (15m)
+                smc_trend_15m        VARCHAR,
+                hh_15m               DOUBLE,
+                ll_15m               DOUBLE,
+                strong_low_15m       DOUBLE,
+                strong_high_15m      DOUBLE,
+                bos_detected_15m     BOOLEAN,
+                choch_detected_15m   BOOLEAN,
+                market_bias_4h       VARCHAR,
+
+                PRIMARY KEY (tick_time, symbol)
             )
         """)
 
@@ -150,16 +198,40 @@ class DuckDBStore:
         self._add_column_if_not_exists("tick_features", "dist_to_nearest_high", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "dist_to_nearest_low", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "session", "VARCHAR")
+        self._add_column_if_not_exists("tick_features", "price_position", "VARCHAR")
+
+        # Phase 1 & 2: SMC Features & Structural Nodes
+        self._add_column_if_not_exists("tick_features", "fvg_timestamp", "TIMESTAMPTZ")
+        self._add_column_if_not_exists("tick_features", "atr_20_1m", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "atr_15_15m", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "prev_day_high", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "prev_day_low", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "current_session_high", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "current_session_low", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "prev_session_high", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "prev_session_low", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "session_boundary", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "n_confirmed_swing_highs_15m", "INTEGER")
+        self._add_column_if_not_exists("tick_features", "n_confirmed_swing_lows_15m", "INTEGER")
+
+        # Phase 2: 15m Structural Nodes
+        self._add_column_if_not_exists("tick_features", "smc_trend_15m", "VARCHAR")
+        self._add_column_if_not_exists("tick_features", "hh_15m", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "ll_15m", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "strong_low_15m", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "strong_high_15m", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "bos_detected_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "choch_detected_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "market_bias_4h", "VARCHAR")
 
         self._add_column_if_not_exists("tick_features", "structure_direction", "VARCHAR")
         self._add_column_if_not_exists("tick_features", "bos_detected", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "choch_detected", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "fvg_high", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "fvg_low", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "fvg_side", "VARCHAR")
-        self._add_column_if_not_exists("tick_features", "fvg_timestamp", "TIMESTAMPTZ")
         self._add_column_if_not_exists("tick_features", "fvg_filled", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "fvg_age_bars", "INTEGER")
-        self._add_column_if_not_exists("tick_features", "price_position", "VARCHAR")
 
     def _add_column_if_not_exists(self, table: str, column: str, dtype: str) -> None:
         """Helper to safely add a column to an existing table."""
@@ -178,10 +250,9 @@ class DuckDBStore:
         Returns the total number of rows inserted.
         """
         batch: list[dict] = []
-        total = 0
+        total_inserted = [0]
 
         def _flush(rows: list[dict]) -> None:
-            nonlocal total
             df = pd.DataFrame(rows)
             df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
             self._con.execute("""
@@ -191,20 +262,20 @@ class DuckDBStore:
                     timestamp_utc, symbol, bid, ask, volume, volume_usd, source
                 FROM df
             """)
-            total += len(rows)
+            total_inserted[0] += len(rows)
 
         for tick in ticks:
             batch.append(tick.model_dump())
             if len(batch) >= batch_size:
                 _flush(batch)
                 batch.clear()
-                logger.debug(f"[DuckDBStore] Flushed batch, total so far: {total}")
+                logger.debug(f"[DuckDBStore] Flushed batch, total so far: {total_inserted[0]}")
 
         if batch:
             _flush(batch)
 
-        logger.info(f"[DuckDBStore] Inserted {total} rows into unified_ticks")
-        return total
+        logger.info(f"[DuckDBStore] Inserted {total_inserted[0]} rows into unified_ticks")
+        return total_inserted[0]
 
     def upsert_features(self, df: pd.DataFrame) -> None:
         """
@@ -225,7 +296,13 @@ class DuckDBStore:
 
             "structure_direction", "bos_detected", "choch_detected",
             "fvg_high", "fvg_low", "fvg_side", "fvg_timestamp", "fvg_filled",
-            "fvg_age_bars", "price_position"
+            "fvg_age_bars", "price_position",
+            "atr_20_1m", "atr_15_15m",
+            "prev_day_high", "prev_day_low", "current_session_high", "current_session_low",
+            "prev_session_high", "prev_session_low", "session_boundary",
+            "n_confirmed_swing_highs_15m", "n_confirmed_swing_lows_15m",
+            "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
+            "bos_detected_15m", "choch_detected_15m", "market_bias_4h"
         ]
         # Only use columns that exist in the DataFrame
         available = [c for c in cols if c in df.columns]
@@ -242,7 +319,14 @@ class DuckDBStore:
             "symbol", "tick_time", "decision", "mid", "bid", "ask",
             "rsi_14", "atr_14", "structure_direction", "bos_detected",
             "choch_detected", "fvg_high", "fvg_low", "fvg_side",
-            "session", "price_position"
+            "session", "price_position",
+            "atr_20_1m", "atr_15_15m",
+            "prev_day_high", "prev_day_low",
+            "current_session_high", "current_session_low",
+            "prev_session_high", "prev_session_low",
+            "n_confirmed_swing_highs_15m", "n_confirmed_swing_lows_15m",
+            "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
+            "bos_detected_15m", "choch_detected_15m", "market_bias_4h"
         ]
         # Ensure tick_time is a datetime object for DuckDB
         if isinstance(decision_data["tick_time"], str):

@@ -39,10 +39,14 @@ class Position(Enum):
     SHORT = "SHORT"
 
 class Action(Enum):
-    HOLD       = "HOLD"
-    OPEN_LONG  = "OPEN_LONG"
-    OPEN_SHORT = "OPEN_SHORT"
-    CLOSE      = "CLOSE"
+    HOLD          = "HOLD"
+    OPEN_T1_LONG  = "OPEN_T1_LONG"
+    OPEN_T1_SHORT = "OPEN_T1_SHORT"
+    OPEN_T2_LONG  = "OPEN_T2_LONG"
+    OPEN_T2_SHORT = "OPEN_T2_SHORT"
+    CLOSE_T1      = "CLOSE_T1"
+    CLOSE_T2      = "CLOSE_T2"
+    CLOSE_ALL     = "CLOSE_ALL"
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -96,7 +100,8 @@ class TickEvent:
 
 @dataclass
 class TradeState:
-    """Mutable state for the active (or absent) trade."""
+    """Mutable state for a single active trade."""
+    type:           str                 = "T1" # "T1" | "T2"
     position:       Position            = Position.FLAT
     entry_price:    Optional[float]     = None
     trailing_stop:  Optional[float]     = None
@@ -229,7 +234,7 @@ class BacktestEngine:
             logger.error("[BacktestEngine] No ticks — aborting")
             return BacktestResult(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-        state         = TradeState()
+        active_trades:  dict[str, TradeState] = {} # Keyed by "T1", "T2"
         trades:         list[CompletedTrade] = []
         equity_curve:   list[float]          = [0.0]
 
@@ -242,59 +247,102 @@ class BacktestEngine:
             mid       = (bid + ask) / 2.0
             spread    = ask - bid
             ts        = pd.Timestamp(row_dict["timestamp_utc"]).to_pydatetime()
-            atr       = _safe_float(row_dict.get("atr_14"))
+            
+            # Default to 14-period ATR for backward compatibility,
+            # but prefer specialized structural ATR when available in context.
+            atr_14    = _safe_float(row_dict.get("atr_14"))
 
-            # ── Trailing stop check BEFORE strategy ───────────────────────
-            if state.position != Position.FLAT:
-
-                # Wide spread — force close (slippage protection)
+            # ── Trade life-cycle management (all active trades) ───────────
+            to_remove = []
+            for tid, tstate in active_trades.items():
+                # Wide spread — force close
                 if self._is_wide_spread(spread):
-                    trade = self._close_trade(state, bid, ask, ts, "wide_spread")
+                    trade = self._close_trade(tstate, bid, ask, ts, "wide_spread")
                     trades.append(trade)
                     equity_curve.append(equity_curve[-1] + trade.pnl)
-                    state = TradeState()
+                    to_remove.append(tid)
                     continue
 
                 # Trailing stop hit
-                if self._check_trailing_stop(state, bid, ask):
-                    trade = self._close_trade(state, bid, ask, ts, "trailing_stop")
+                if self._check_trailing_stop(tstate, bid, ask):
+                    trade = self._close_trade(tstate, bid, ask, ts, "trailing_stop")
                     trades.append(trade)
                     equity_curve.append(equity_curve[-1] + trade.pnl)
-                    state = TradeState()
+                    to_remove.append(tid)
                     continue
 
-                # Ratchet trailing stop upward/downward
-                self._update_trailing_stop(state, bid, ask)
+                # Ratchet trailing stop
+                self._update_trailing_stop(tstate, bid, ask)
+
+            for tid in to_remove:
+                active_trades.pop(tid, None)
 
             # ── Strategy decision ─────────────────────────────────────────
             from src.bot.strategy_scout_sniper import build_context_from_row, make_decision
-            ctx    = build_context_from_row(row_dict)
+            ctx = build_context_from_row(row_dict)
+            
+            # Inject current trade status
+            ctx.t1_active = ("T1" in active_trades)
+            ctx.t2_active = ("T2" in active_trades)
+            
             action = make_decision(ctx)
 
-            if action == Action.OPEN_LONG and state.position == Position.FLAT:
-                self._open_trade(state, Position.LONG, ask, ts, spread, atr)
+            # Resolve stop-sizing ATR (prefer 15m structural ATR)
+            target_atr = ctx.atr_15_15m if ctx.atr_15_15m else atr_14
 
-            elif action == Action.OPEN_SHORT and state.position == Position.FLAT:
-                self._open_trade(state, Position.SHORT, bid, ts, spread, atr)
+            if action == Action.OPEN_T1_LONG and "T1" not in active_trades:
+                s1 = TradeState(type="T1")
+                self._open_trade(s1, Position.LONG, ask, ts, spread, target_atr)
+                active_trades["T1"] = s1
 
-            elif action == Action.CLOSE and state.position != Position.FLAT:
-                trade = self._close_trade(state, bid, ask, ts, "strategy")
+            elif action == Action.OPEN_T1_SHORT and "T1" not in active_trades:
+                s1 = TradeState(type="T1")
+                self._open_trade(s1, Position.SHORT, bid, ts, spread, target_atr)
+                active_trades["T1"] = s1
+
+            elif action == Action.OPEN_T2_LONG and "T2" not in active_trades:
+                s2 = TradeState(type="T2")
+                self._open_trade(s2, Position.LONG, ask, ts, spread, target_atr)
+                active_trades["T2"] = s2
+
+            elif action == Action.OPEN_T2_SHORT and "T2" not in active_trades:
+                s2 = TradeState(type="T2")
+                self._open_trade(s2, Position.SHORT, bid, ts, spread, target_atr)
+                active_trades["T2"] = s2
+
+            elif action == Action.CLOSE_T1 and "T1" in active_trades:
+                trade = self._close_trade(active_trades["T1"], bid, ask, ts, "strategy")
                 trades.append(trade)
                 equity_curve.append(equity_curve[-1] + trade.pnl)
-                state = TradeState()
+                active_trades.pop("T1", None)
+
+            elif action == Action.CLOSE_T2 and "T2" in active_trades:
+                trade = self._close_trade(active_trades["T2"], bid, ask, ts, "strategy")
+                trades.append(trade)
+                equity_curve.append(equity_curve[-1] + trade.pnl)
+                active_trades.pop("T2", None)
+
+            elif action == Action.CLOSE_ALL:
+                for tid in list(active_trades.keys()):
+                    trade = self._close_trade(active_trades[tid], bid, ask, ts, "strategy_all")
+                    trades.append(trade)
+                    equity_curve.append(equity_curve[-1] + trade.pnl)
+                    active_trades.pop(tid, None)
 
         # ── Close any open position at end of data ────────────────────────
-        if state.position != Position.FLAT and not ticks_df.empty:
+        if active_trades and not ticks_df.empty:
             last  = dict(ticks_df.iloc[-1])
-            trade = self._close_trade(
-                state,
-                float(last.get("bid", 0.0)),
-                float(last.get("ask", 0.0)),
-                pd.Timestamp(last["timestamp_utc"]).to_pydatetime(),
-                "end_of_data",
-            )
-            trades.append(trade)
-            equity_curve.append(equity_curve[-1] + trade.pnl)
+            for tid, tstate in list(active_trades.items()):
+                trade = self._close_trade(
+                    tstate,
+                    float(last.get("bid", 0.0)),
+                    float(last.get("ask", 0.0)),
+                    pd.Timestamp(last["timestamp_utc"]).to_pydatetime(),
+                    "end_of_data",
+                )
+                trades.append(trade)
+                equity_curve.append(equity_curve[-1] + trade.pnl)
+            active_trades.clear()
 
         return self._compile_results(trades, len(ticks_df), equity_curve)
 

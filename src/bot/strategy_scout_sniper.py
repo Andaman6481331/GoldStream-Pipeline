@@ -71,11 +71,42 @@ class ScoutSniperContext:
     choch_detected:      Optional[bool]  # Change of Character on this tick
 
     # ── Fair Value Gap (NEW — FVG sniper entry) ───────────────────────────
-    fvg_high:     Optional[float]  # top of nearest active FVG
-    fvg_low:      Optional[float]  # bottom of nearest active FVG
-    fvg_side:     Optional[str]    # "bullish_fvg" | "bearish_fvg"
-    fvg_filled:   Optional[bool]   # True = already mitigated, skip
-    fvg_age_bars: Optional[int]    # bars since FVG formed
+    fvg_high:     Optional[float] = None  # top of nearest active FVG
+    fvg_low:      Optional[float] = None  # bottom of nearest active FVG
+    fvg_side:     Optional[str]    = None  # "bullish_fvg" | "bearish_fvg"
+    fvg_filled:   bool = False             # True = already mitigated, skip
+    fvg_age_bars: Optional[int]    = None  # bars since FVG formed
+
+    # ── Phase 1 SMC (NEW — multi-timeframe & liquidity scoring) ───────────
+    atr_20_1m:    Optional[float] = None  # FVG noise filter
+    atr_15_15m:   Optional[float] = None  # structural volatility
+    prev_day_high: Optional[float] = None
+    prev_day_low:  Optional[float] = None
+    current_session_high: Optional[float] = None
+    current_session_low:  Optional[float] = None
+    prev_session_high:    Optional[float] = None
+    prev_session_low:     Optional[float] = None
+    session_boundary:     bool = False
+    n_confirmed_swing_highs_15m: int = 0
+    n_confirmed_swing_lows_15m:  int = 0
+
+    # ── Phase 2 SMC (New — structural nodes) ─────────────────────────────
+    smc_trend_15m:   Optional[str]   = None
+    hh_15m:          Optional[float] = None
+    ll_15m:          Optional[float] = None
+    strong_low_15m:  Optional[float] = None
+    strong_high_15m: Optional[float] = None
+    bos_detected_15m:   bool = False
+    choch_detected_15m: bool = False
+    market_bias_4h:    Optional[str] = None
+
+    # ── Trade status (passed from engine) ────────────────────────────────
+    t1_active:   bool = False
+    t2_active:   bool = False
+
+    # ── Liquidity (NEW — for sniper entry) ──────────────────────────────
+    liq_swept:   bool = False
+    liq_side:    Optional[str] = None # "high" | "low"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,75 +126,49 @@ SHORT_RSI_MIN        = 45     # RSI floor for shorts (not oversold)
 def make_decision(ctx: ScoutSniperContext) -> Action:
     """
     Scout & Sniper execution engine.
-
-    ── LONG thesis ──────────────────────────────────────────────────────────
-        Scout:  Bullish CHoCH or BOS detected → structure shifted upward.
-        Sniper: Price retraces into a fresh bullish FVG (imbalance below
-                current price formed during the impulse move up).
-                Enter long from FVG low/mid — stop below FVG low.
-
-    ── SHORT thesis ─────────────────────────────────────────────────────────
-        Scout:  Bearish CHoCH or BOS detected → structure shifted downward.
-        Sniper: Price retraces into a fresh bearish FVG (imbalance above
-                current price formed during the impulse move down).
-                Enter short from FVG high/mid — stop above FVG high.
+    
+    1. Scout (T1): Fires on 15m BOS/CHoCH. Must match 4H bias.
+    2. Sniper (T2): Fires on 5m liquidity sweep IF T1 is already active.
     """
 
     # ── Gate 1: session ───────────────────────────────────────────────────
     if ctx.session not in ("killzone", "london"):
-        return Action.HOLD
+        pass
 
     # ── Gate 2: spread filter ─────────────────────────────────────────────
     if ctx.atr_14 and ctx.atr_14 > 0:
+        if ctx.atr_14 is None or ctx.spread is None:
+            return Action.HOLD
         if ctx.spread > ctx.atr_14 * MAX_SPREAD_ATR_RATIO:
             return Action.HOLD
 
-    # ── Gate 3: structure bias must be established ────────────────────────
-    if ctx.structure_direction is None:
+    # ── Gate 3: 4H Bias ───────────────────────────────────────────────────
+    if not ctx.market_bias_4h or ctx.market_bias_4h == "neutral":
         return Action.HOLD
 
-    # Optional: You could add a check for a "recent" break here if desired,
-    # but structure_direction forward-fills the latest bias.
+    # ── TRADE 1: SCOUT (Structural Break) ─────────────────────────────────
+    if not ctx.t1_active:
+        # Long Scout
+        if ctx.market_bias_4h == "bullish" and ctx.smc_trend_15m == "bull":
+            if ctx.bos_detected_15m or ctx.choch_detected_15m:
+                return Action.OPEN_T1_LONG
+        
+        # Short Scout
+        if ctx.market_bias_4h == "bearish" and ctx.smc_trend_15m == "bear":
+            if ctx.bos_detected_15m or ctx.choch_detected_15m:
+                return Action.OPEN_T1_SHORT
 
-    # ── Gate 4: FVG must be valid and fresh ───────────────────────────────
-    if _any_none(ctx.fvg_high, ctx.fvg_low, ctx.fvg_side, ctx.fvg_filled):
-        return Action.HOLD
+    # ── TRADE 2: SNIPER (Liquidity Sweep) ─────────────────────────────────
+    if ctx.t1_active and not ctx.t2_active:
+        if ctx.liq_swept and ctx.liq_side is not None:
+            # Bullish sweep (sweep of a low)
+            if ctx.smc_trend_15m == "bull" and ctx.liq_side == "low":
+                return Action.OPEN_T2_LONG
+            
+            # Bearish sweep (sweep of a high)
+            if ctx.smc_trend_15m == "bear" and ctx.liq_side == "high":
+                return Action.OPEN_T2_SHORT
 
-    if ctx.fvg_filled:
-        return Action.HOLD
-
-    if ctx.fvg_age_bars is not None and ctx.fvg_age_bars > MAX_FVG_AGE_BARS:
-        return Action.HOLD
-
-    # ── Gate 5: price must be INSIDE the FVG (sniper entry) ───────────────
-    price_in_fvg = ctx.fvg_low <= ctx.mid <= ctx.fvg_high
-    if not price_in_fvg:
-        return Action.HOLD
-
-    # ── Gate 6: price position must be known ─────────────────────────────
-    if ctx.price_position is None:
-        return Action.HOLD
-
-    # ── LONG: bullish structure + bullish FVG + discount zone ────────────
-    long_ok = (
-        ctx.structure_direction == "bullish"
-        and ctx.fvg_side == "bullish_fvg"
-        and ctx.price_position in ("discount", "discount_extreme")
-        and (ctx.rsi_14 is None or ctx.rsi_14 < LONG_RSI_MAX)
-    )
-
-    # ── SHORT: bearish structure + bearish FVG + premium zone ────────────
-    short_ok = (
-        ctx.structure_direction == "bearish"
-        and ctx.fvg_side == "bearish_fvg"
-        and ctx.price_position in ("premium", "premium_extreme")
-        and (ctx.rsi_14 is None or ctx.rsi_14 > SHORT_RSI_MIN)
-    )
-
-    if long_ok:
-        return Action.OPEN_LONG
-    if short_ok:
-        return Action.OPEN_SHORT
     return Action.HOLD
 
 
@@ -216,8 +221,39 @@ def build_context_from_row(row: dict) -> ScoutSniperContext:
         fvg_high=_safe_float(row.get("fvg_high")),
         fvg_low=_safe_float(row.get("fvg_low")),
         fvg_side=row.get("fvg_side"),
-        fvg_filled=_safe_bool(row.get("fvg_filled")) or False,
+        fvg_filled=bool(row.get("fvg_filled", False)),
         fvg_age_bars=_safe_int(row.get("fvg_age_bars")),
+
+        # ── Phase 1 SMC (new columns) ─────────────────────────────────────
+        atr_20_1m=_safe_float(row.get("atr_20_1m")),
+        atr_15_15m=_safe_float(row.get("atr_15_15m")),
+        prev_day_high=_safe_float(row.get("prev_day_high")),
+        prev_day_low=_safe_float(row.get("prev_day_low")),
+        current_session_high=_safe_float(row.get("current_session_high")),
+        current_session_low=_safe_float(row.get("current_session_low")),
+        prev_session_high=_safe_float(row.get("prev_session_high")),
+        prev_session_low=_safe_float(row.get("prev_session_low")),
+        session_boundary=bool(row.get("session_boundary", False)),
+        n_confirmed_swing_highs_15m=_safe_int(row.get("n_confirmed_swing_highs_15m")) or 0,
+        n_confirmed_swing_lows_15m=_safe_int(row.get("n_confirmed_swing_lows_15m")) or 0,
+
+        # ── Phase 2 SMC (new columns) ─────────────────────────────────────
+        smc_trend_15m=row.get("smc_trend_15m"),
+        hh_15m=_safe_float(row.get("hh_15m")),
+        ll_15m=_safe_float(row.get("ll_15m")),
+        strong_low_15m=_safe_float(row.get("strong_low_15m")),
+        strong_high_15m=_safe_float(row.get("strong_high_15m")),
+        bos_detected_15m=bool(row.get("bos_detected_15m", False)),
+        choch_detected_15m=bool(row.get("choch_detected_15m", False)),
+        market_bias_4h=row.get("market_bias_4h"),
+
+        # ── Liquidity (NEW for Sniper) ────────────────────────────────────
+        liq_swept=bool(row.get("liq_swept", False)),
+        liq_side=row.get("liq_side"),
+
+        # Trade status should be injected by engine after building context
+        t1_active=False,
+        t2_active=False,
     )
 
 
@@ -277,6 +313,8 @@ def _safe_bool(val) -> Optional[bool]:
 
 def _safe_int(val) -> Optional[int]:
     try:
-        return int(val)
+        if val is None:
+            return None
+        return int(float(val))
     except (TypeError, ValueError):
         return None

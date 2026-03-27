@@ -86,6 +86,18 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                     "fvg_side": ctx.fvg_side,
                     "session": ctx.session,
                     "price_position": ctx.price_position,
+                    # NEW-P1: SMC Extended Context
+                    "atr_20_1m": ctx.atr_20_1m,
+                    "atr_15_15m": ctx.atr_15_15m,
+                    "prev_day_high": ctx.prev_day_high,
+                    "prev_day_low": ctx.prev_day_low,
+                    "current_session_high": ctx.current_session_high,
+                    "current_session_low": ctx.current_session_low,
+                    "prev_session_high": ctx.prev_session_high,
+                    "prev_session_low": ctx.prev_session_low,
+                    "session_boundary": ctx.session_boundary,
+                    "n_confirmed_swing_highs_15m": ctx.n_confirmed_swing_highs_15m,
+                    "n_confirmed_swing_lows_15m": ctx.n_confirmed_swing_lows_15m,
                 }
 
                 # Persist to DuckDB
