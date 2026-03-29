@@ -138,16 +138,13 @@ class DuckDBStore:
                 mid             DOUBLE,
                 bid             DOUBLE,
                 ask             DOUBLE,
-                rsi_14          DOUBLE,
-                atr_14          DOUBLE,
-                structure_direction VARCHAR,
-                bos_detected    BOOLEAN,
-                choch_detected  BOOLEAN,
+                session         VARCHAR,
+                price_position  VARCHAR,
                 fvg_high        DOUBLE,
                 fvg_low         DOUBLE,
                 fvg_side        VARCHAR,
-                session         VARCHAR,
-                price_position  VARCHAR,
+                fvg_filled      BOOLEAN,
+                fvg_age_bars    INTEGER,
                 -- Phase 1 SMC Extended Context
                 atr_20_1m       DOUBLE,
                 atr_15_15m      DOUBLE,
@@ -172,6 +169,54 @@ class DuckDBStore:
                 market_bias_4h       VARCHAR,
 
                 PRIMARY KEY (tick_time, symbol)
+            )
+        """)
+
+        # ── Multi-Timeframe Candle Tables ─────────────────────────────────────
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS candles_1m (
+                bar_time    TIMESTAMPTZ NOT NULL,
+                symbol      VARCHAR     NOT NULL,
+                source      VARCHAR     NOT NULL,
+                bar_open    DOUBLE      NOT NULL,
+                bar_high    DOUBLE      NOT NULL,
+                bar_low     DOUBLE      NOT NULL,
+                bar_close   DOUBLE      NOT NULL,
+                atr_20_1m   DOUBLE,
+                PRIMARY KEY (bar_time, symbol, source)
+            )
+        """)
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS candles_15m (
+                bar_time            TIMESTAMPTZ NOT NULL,
+                symbol              VARCHAR     NOT NULL,
+                source              VARCHAR     NOT NULL,
+                bar_open            DOUBLE      NOT NULL,
+                bar_high            DOUBLE      NOT NULL,
+                bar_low             DOUBLE      NOT NULL,
+                bar_close           DOUBLE      NOT NULL,
+                atr_15_15m          DOUBLE,
+                smc_trend_15m       VARCHAR,
+                hh_15m              DOUBLE,
+                ll_15m              DOUBLE,
+                strong_low_15m      DOUBLE,
+                strong_high_15m     DOUBLE,
+                bos_detected_15m    BOOLEAN,
+                choch_detected_15m  BOOLEAN,
+                PRIMARY KEY (bar_time, symbol, source)
+            )
+        """)
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS candles_4h (
+                bar_time        TIMESTAMPTZ NOT NULL,
+                symbol          VARCHAR     NOT NULL,
+                source          VARCHAR     NOT NULL,
+                bar_open        DOUBLE      NOT NULL,
+                bar_high        DOUBLE      NOT NULL,
+                bar_low         DOUBLE      NOT NULL,
+                bar_close       DOUBLE      NOT NULL,
+                market_bias_4h  VARCHAR,
+                PRIMARY KEY (bar_time, symbol, source)
             )
         """)
 
@@ -232,6 +277,11 @@ class DuckDBStore:
         self._add_column_if_not_exists("tick_features", "fvg_side", "VARCHAR")
         self._add_column_if_not_exists("tick_features", "fvg_filled", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "fvg_age_bars", "INTEGER")
+
+        # trade_decisions migrations
+        self._add_column_if_not_exists("trade_decisions", "fvg_filled", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "fvg_age_bars", "INTEGER")
+        self._add_column_if_not_exists("trade_decisions", "fvg_timestamp", "TIMESTAMPTZ")
 
     def _add_column_if_not_exists(self, table: str, column: str, dtype: str) -> None:
         """Helper to safely add a column to an existing table."""
@@ -313,17 +363,41 @@ class DuckDBStore:
         self._con.execute(f"INSERT INTO tick_features ({col_names}) SELECT {col_names} FROM df")
         logger.info(f"[DuckDBStore] Upserted {len(df)} rows into tick_features")
 
+    def upsert_candles(self, table: str, df: pd.DataFrame) -> None:
+        """
+        Upsert a candle DataFrame into one of the candle tables (candles_1m, 15m, 4h).
+        Any existing rows for the same symbol are replaced.
+        Uses INSERT INTO ... BY NAME to correctly map DataFrame columns to table schema.
+        """
+        if df.empty:
+            return
+        
+        # Ensure bar_time is a timestamp
+        if "bar_time" in df.columns:
+            df["bar_time"] = pd.to_datetime(df["bar_time"], utc=True)
+
+        symbol = df["symbol"].iloc[0]
+        self._con.execute(f"DELETE FROM {table} WHERE symbol = ?", [symbol])
+        
+        # Only select columns that exist in the target table to avoid extra columns in DF error
+        target_cols_q = self._con.execute(f"DESCRIBE {table}").fetchall()
+        target_cols = [c[0] for c in target_cols_q]
+        df_cols = [c for c in df.columns if c in target_cols]
+        
+        # Perform insertion by name
+        self._con.execute(f"INSERT INTO {table} ({', '.join(df_cols)}) SELECT {', '.join(df_cols)} FROM df")
+        logger.info(f"[DuckDBStore] Upserted {len(df)} rows into {table}")
+
     def insert_trade_decision(self, decision_data: dict) -> None:
         """Persist a single trade decision into the trade_decisions table."""
         cols = [
             "symbol", "tick_time", "decision", "mid", "bid", "ask",
-            "rsi_14", "atr_14", "structure_direction", "bos_detected",
-            "choch_detected", "fvg_high", "fvg_low", "fvg_side",
             "session", "price_position",
+            "fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars", "fvg_timestamp",
             "atr_20_1m", "atr_15_15m",
             "prev_day_high", "prev_day_low",
             "current_session_high", "current_session_low",
-            "prev_session_high", "prev_session_low",
+            "prev_session_high", "prev_session_low", "session_boundary",
             "n_confirmed_swing_highs_15m", "n_confirmed_swing_lows_15m",
             "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
             "bos_detected_15m", "choch_detected_15m", "market_bias_4h"

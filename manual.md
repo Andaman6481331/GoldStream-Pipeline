@@ -74,6 +74,10 @@ duckdb data/gold/goldstream.duckdb -s "SELECT * FROM trade_decisions ORDER BY ti
 ---
 
 ## ⚡ Quick Shell Commands
+- **Remove Old Data DuckDB**: `rm data/gold/goldstream.duckdb` (bash)
 - **Ingest & Audit History**: `python ingest_history.py --start 2024-03-01 --end 2024-03-07`
+    - **Skip Download**: `python ingest_history.py --start 2024-03-01 --end 2024-03-07 --skip-download` - only if you already have the data in bronze(.parquet)
+    - **Skip Silver & Download**: `python ingest_history.py --start 2024-03-01 --end 2024-03-07 --skip-silver --skip-download` - only if you already have the data in silver(.duckdb)
+- **SMC Visual Audit**: `python src/bot/visualizer.py` (requires `pip install plotly`)
 - **Run Live Pipeline**: `python main.py`
 - **Check DB Ticks**: `python -c "import duckdb; print(duckdb.connect('data/gold/goldstream.duckdb', read_only=True).execute('SELECT COUNT(*) FROM tick_features').fetchone()[0])"`

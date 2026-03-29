@@ -38,8 +38,8 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                     ON f.timestamp_utc = t.tick_time
                     AND f.symbol = t.symbol
                 WHERE t.tick_time IS NULL              -- not yet processed
-                  AND f.rsi_14 IS NOT NULL             -- health check
-                  AND (f.bos_detected = TRUE OR f.choch_detected = TRUE) -- structure trigger
+                  AND f.atr_15_15m IS NOT NULL         -- health check
+                  AND (f.bos_detected_15m = TRUE OR f.choch_detected_15m = TRUE) -- structure trigger
                 ORDER BY f.timestamp_utc ASC
                 LIMIT 1000
             """
@@ -76,17 +76,13 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                     "mid": ctx.mid,
                     "bid": ctx.bid,
                     "ask": ctx.ask,
-                    "rsi_14": ctx.rsi_14,
-                    "atr_14": ctx.atr_14,
-                    "structure_direction": ctx.structure_direction,
-                    "bos_detected": ctx.bos_detected,
-                    "choch_detected": ctx.choch_detected,
+                    "session": ctx.session,
+                    "price_position": ctx.price_position,
                     "fvg_high": ctx.fvg_high,
                     "fvg_low": ctx.fvg_low,
                     "fvg_side": ctx.fvg_side,
-                    "session": ctx.session,
-                    "price_position": ctx.price_position,
-                    # NEW-P1: SMC Extended Context
+                    "fvg_filled": ctx.fvg_filled,
+                    "fvg_age_bars": ctx.fvg_age_bars,
                     "atr_20_1m": ctx.atr_20_1m,
                     "atr_15_15m": ctx.atr_15_15m,
                     "prev_day_high": ctx.prev_day_high,
@@ -98,6 +94,15 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                     "session_boundary": ctx.session_boundary,
                     "n_confirmed_swing_highs_15m": ctx.n_confirmed_swing_highs_15m,
                     "n_confirmed_swing_lows_15m": ctx.n_confirmed_swing_lows_15m,
+                    "fvg_timestamp": ctx.fvg_timestamp,
+                    "smc_trend_15m": ctx.smc_trend_15m,
+                    "hh_15m": ctx.hh_15m,
+                    "ll_15m": ctx.ll_15m,
+                    "strong_low_15m": ctx.strong_low_15m,
+                    "strong_high_15m": ctx.strong_high_15m,
+                    "bos_detected_15m": ctx.bos_detected_15m,
+                    "choch_detected_15m": ctx.choch_detected_15m,
+                    "market_bias_4h": ctx.market_bias_4h,
                 }
 
                 # Persist to DuckDB
@@ -107,7 +112,7 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                 logger.info(
                     f"🎯 {decision_str:10s} | "
                     f"BID={ctx.bid:.5f} | "
-                    f"Structure={ctx.structure_direction} | "
+                    f"Trend={ctx.smc_trend_15m} | "
                     f"FVG Side={ctx.fvg_side} | "
                     f"Session={ctx.session}"
                 )

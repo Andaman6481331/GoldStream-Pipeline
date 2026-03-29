@@ -46,8 +46,7 @@ from src.backtest.backtest_engine import Action
 class ScoutSniperContext:
     """
     Full tick context for the Scout & Sniper engine.
-    All fields map 1-to-1 to tick_features DB columns.
-    Existing columns are kept; new SMC columns are added below.
+    All fields map to tick_features DB columns.
     """
 
     # ── Price ─────────────────────────────────────────────────────────────
@@ -56,30 +55,21 @@ class ScoutSniperContext:
     ask:    float
     spread: float
 
-    # ── Indicators ────────────────────────────────────────────────────────
-    rsi_14: Optional[float]
-    atr_14: Optional[float]
-
-    # ── Session & position (carried over from old strategy) ───────────────
-    session:        Optional[str]   # killzone | london | new_york | asian
-    price_position: Optional[str]   # premium_extreme | premium | discount | discount_extreme
+    # ── Session & position ────────────────────────────────────────────────
+    session:        Optional[str]
+    price_position: Optional[str]
     bar_close:      Optional[float]
 
-    # ── Market structure (NEW — BOS / CHoCH) ─────────────────────────────
-    structure_direction: Optional[str]   # "bullish" | "bearish"
-    bos_detected:        Optional[bool]  # Break of Structure on this tick
-    choch_detected:      Optional[bool]  # Change of Character on this tick
+    # ── Fair Value Gap (1m Sniper entry) ──────────────────────────────────
+    fvg_high:     Optional[float] = None
+    fvg_low:      Optional[float] = None
+    fvg_side:     Optional[str]    = None
+    fvg_filled:   bool = False
+    fvg_age_bars: Optional[int]    = None
 
-    # ── Fair Value Gap (NEW — FVG sniper entry) ───────────────────────────
-    fvg_high:     Optional[float] = None  # top of nearest active FVG
-    fvg_low:      Optional[float] = None  # bottom of nearest active FVG
-    fvg_side:     Optional[str]    = None  # "bullish_fvg" | "bearish_fvg"
-    fvg_filled:   bool = False             # True = already mitigated, skip
-    fvg_age_bars: Optional[int]    = None  # bars since FVG formed
-
-    # ── Phase 1 SMC (NEW — multi-timeframe & liquidity scoring) ───────────
-    atr_20_1m:    Optional[float] = None  # FVG noise filter
-    atr_15_15m:   Optional[float] = None  # structural volatility
+    # ── SMC Phase 1 (Multi-timeframe & Liquidity) ─────────────────────────
+    atr_20_1m:    Optional[float] = None
+    atr_15_15m:   Optional[float] = None
     prev_day_high: Optional[float] = None
     prev_day_low:  Optional[float] = None
     current_session_high: Optional[float] = None
@@ -90,21 +80,22 @@ class ScoutSniperContext:
     n_confirmed_swing_highs_15m: int = 0
     n_confirmed_swing_lows_15m:  int = 0
 
-    # ── Phase 2 SMC (New — structural nodes) ─────────────────────────────
-    smc_trend_15m:   Optional[str]   = None
-    hh_15m:          Optional[float] = None
-    ll_15m:          Optional[float] = None
-    strong_low_15m:  Optional[float] = None
-    strong_high_15m: Optional[float] = None
+    # ── SMC Phase 2 (Structural Nodes & Bias) ─────────────────────────────
+    smc_trend_15m:      Optional[str]   = None
+    hh_15m:             Optional[float] = None
+    ll_15m:             Optional[float] = None
+    strong_low_15m:     Optional[float] = None
+    strong_high_15m:    Optional[float] = None
     bos_detected_15m:   bool = False
     choch_detected_15m: bool = False
-    market_bias_4h:    Optional[str] = None
+    market_bias_4h:     Optional[str]   = None
+    fvg_timestamp:      Optional[pd.Timestamp] = None
 
-    # ── Trade status (passed from engine) ────────────────────────────────
+    # ── Trade status ──────────────────────────────────────────────────────
     t1_active:   bool = False
     t2_active:   bool = False
 
-    # ── Liquidity (NEW — for sniper entry) ──────────────────────────────
+    # ── Liquidity (Sniper entry) ──────────────────────────────────────────
     liq_swept:   bool = False
     liq_side:    Optional[str] = None # "high" | "low"
 
@@ -136,10 +127,10 @@ def make_decision(ctx: ScoutSniperContext) -> Action:
         pass
 
     # ── Gate 2: spread filter ─────────────────────────────────────────────
-    if ctx.atr_14 and ctx.atr_14 > 0:
-        if ctx.atr_14 is None or ctx.spread is None:
-            return Action.HOLD
-        if ctx.spread > ctx.atr_14 * MAX_SPREAD_ATR_RATIO:
+    # ── Gate 2: spread filter (SMC: use 15m ATR) ──────────────────────────
+    atr = ctx.atr_15_15m or 0.0
+    if atr > 0:
+        if ctx.spread > atr * MAX_SPREAD_ATR_RATIO:
             return Action.HOLD
 
     # ── Gate 3: 4H Bias ───────────────────────────────────────────────────
@@ -188,14 +179,6 @@ def build_context_from_row(row: dict) -> ScoutSniperContext:
     ask = float(row.get("ask", 0.0))
     mid = (bid + ask) / 2.0
 
-    dist_high = _safe_float(row.get("dist_to_nearest_high"))
-    dist_low  = _safe_float(row.get("dist_to_nearest_low"))
-
-    # Derive premium/discount if not pre-tagged by FeatureEngineer
-    price_position = row.get("price_position") or _derive_price_position(
-        dist_high, dist_low
-    )
-
     return ScoutSniperContext(
         # ── Price ─────────────────────────────────────────────────────────
         mid=mid,
@@ -203,28 +186,19 @@ def build_context_from_row(row: dict) -> ScoutSniperContext:
         ask=ask,
         spread=ask - bid,
 
-        # ── Indicators ────────────────────────────────────────────────────
-        rsi_14=_safe_float(row.get("rsi_14")),
-        atr_14=_safe_float(row.get("atr_14")),
-
-        # ── Session / position (unchanged columns) ────────────────────────
+        # ── Session / position ────────────────────────────────────────────
         session=row.get("session"),
-        price_position=price_position,
+        price_position=row.get("price_position"),
         bar_close=_safe_float(row.get("bar_close")),
 
-        # ── Market structure (new columns) ────────────────────────────────
-        structure_direction=row.get("structure_direction"),
-        bos_detected=_safe_bool(row.get("bos_detected")),
-        choch_detected=_safe_bool(row.get("choch_detected")),
-
-        # ── FVG (new columns) ─────────────────────────────────────────────
+        # ── FVG (1m Sniper entry) ─────────────────────────────────────────
         fvg_high=_safe_float(row.get("fvg_high")),
         fvg_low=_safe_float(row.get("fvg_low")),
         fvg_side=row.get("fvg_side"),
         fvg_filled=bool(row.get("fvg_filled", False)),
         fvg_age_bars=_safe_int(row.get("fvg_age_bars")),
 
-        # ── Phase 1 SMC (new columns) ─────────────────────────────────────
+        # ── Phase 1 SMC ───────────────────────────────────────────────────
         atr_20_1m=_safe_float(row.get("atr_20_1m")),
         atr_15_15m=_safe_float(row.get("atr_15_15m")),
         prev_day_high=_safe_float(row.get("prev_day_high")),
@@ -237,7 +211,7 @@ def build_context_from_row(row: dict) -> ScoutSniperContext:
         n_confirmed_swing_highs_15m=_safe_int(row.get("n_confirmed_swing_highs_15m")) or 0,
         n_confirmed_swing_lows_15m=_safe_int(row.get("n_confirmed_swing_lows_15m")) or 0,
 
-        # ── Phase 2 SMC (new columns) ─────────────────────────────────────
+        # ── Phase 2 SMC ───────────────────────────────────────────────────
         smc_trend_15m=row.get("smc_trend_15m"),
         hh_15m=_safe_float(row.get("hh_15m")),
         ll_15m=_safe_float(row.get("ll_15m")),
@@ -246,12 +220,12 @@ def build_context_from_row(row: dict) -> ScoutSniperContext:
         bos_detected_15m=bool(row.get("bos_detected_15m", False)),
         choch_detected_15m=bool(row.get("choch_detected_15m", False)),
         market_bias_4h=row.get("market_bias_4h"),
+        fvg_timestamp=row.get("fvg_timestamp"),
 
-        # ── Liquidity (NEW for Sniper) ────────────────────────────────────
+        # ── Liquidity (Sniper entry) ──────────────────────────────────────
         liq_swept=bool(row.get("liq_swept", False)),
         liq_side=row.get("liq_side"),
 
-        # Trade status should be injected by engine after building context
         t1_active=False,
         t2_active=False,
     )

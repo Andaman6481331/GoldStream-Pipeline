@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 DUKASCOPY_CDN = "https://datafeed.dukascopy.com/datafeed"
 BI5_STRUCT_FMT = ">IIIff"       # big-endian: uint32, uint32, uint32, float32, float32
 BI5_ROW_SIZE = struct.calcsize(BI5_STRUCT_FMT)   # 20 bytes
-POINT_DIVISOR = 100_000.0       # 5-digit broker normalisation (XAUUSD uses 100_000)
+POINT_DIVISOR = 1000.0          # Adjusted for XAUUSD (2 or 3 decimal places)
 
 # Parquet schema for Bronze layer
 BRONZE_SCHEMA = pa.schema([
@@ -61,12 +61,14 @@ class HistoryDownloader:
         asyncio.run(downloader.download_range("2024-01-01", "2024-01-31"))
     """
 
+
+
     def __init__(
         self,
         symbol: str = "XAUUSD",
         output_dir: str = "data/bronze",
-        max_concurrent: int = 8,
-        request_timeout: int = 30,
+        max_concurrent: int = 5,
+        request_timeout: int = 45,
     ):
         self.symbol = symbol.upper()
         self.output_dir = Path(output_dir)
@@ -129,17 +131,33 @@ class HistoryDownloader:
         summary: dict,
     ) -> None:
         url = self._build_url(hour_dt)
+        max_retries = 3
+        
         async with semaphore:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status == 404:
-                        # No trading data for this hour (weekend, holiday, etc.)
+            for attempt in range(max_retries):
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status == 404:
+                            summary["hours_skipped"] += 1
+                            return
+                        if resp.status == 503:
+                            wait = (attempt + 1) * 2
+                            logger.warning(f"[HistoryDownloader] 503 for {hour_dt} - Retrying in {wait}s...")
+                            await asyncio.sleep(wait)
+                            continue
+                            
+                        resp.raise_for_status()
+                        raw_bytes = await resp.read()
+                        break # Success
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    if attempt == max_retries - 1:
+                        logger.error(f"[HistoryDownloader] Final failure for {url}: {exc}")
                         summary["hours_skipped"] += 1
                         return
-                    resp.raise_for_status()
-                    raw_bytes = await resp.read()
-            except aiohttp.ClientError as exc:
-                logger.warning(f"[HistoryDownloader] HTTP error for {url}: {exc}")
+                    wait = (attempt + 1) * 2
+                    logger.warning(f"[HistoryDownloader] Error for {hour_dt}: {exc}. Retry {attempt+1}/{max_retries}")
+                    await asyncio.sleep(wait)
+            else:
                 summary["hours_skipped"] += 1
                 return
 

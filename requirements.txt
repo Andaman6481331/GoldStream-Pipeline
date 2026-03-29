@@ -9,3 +9,5 @@ aiohttp
 aiofiles
 pyarrow
 duckdb
+pytz
+plotly

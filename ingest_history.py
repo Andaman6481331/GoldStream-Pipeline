@@ -50,6 +50,7 @@ async def run_pipeline(
     bronze_dir: str = "data/bronze",
     gold_db:    str = "data/gold/goldstream.duckdb",
     skip_download: bool = False,
+    skip_silver:   bool = False,
 ) -> None:
     """
     Full historical ingestion pipeline:
@@ -92,14 +93,18 @@ async def run_pipeline(
     with DuckDBStore(db_path=gold_db) as store:
         store.init_schema()
 
-        # Insert unified ticks
-        logger.info("[Gold] Inserting UnifiedTick rows into DuckDB")
-        inserted = store.insert_unified_ticks(iter(unified_ticks))
-        logger.info(f"[Gold] {inserted:,} rows in unified_ticks")
+        if not skip_silver:
+            # Insert unified ticks
+            logger.info("[Gold] Inserting UnifiedTick rows into DuckDB")
+            inserted = store.insert_unified_ticks(iter(unified_ticks))
+            logger.info(f"[Gold] {inserted:,} rows in unified_ticks")
+            ticks_df = pd.DataFrame([t.model_dump() for t in unified_ticks])
+        else:
+            logger.info("[Gold] Skipping Silver — loading UnifiedTick rows from DuckDB store")
+            ticks_df = store._con.execute("SELECT * FROM unified_ticks").df()
 
         # Build features
-        logger.info("[Gold] Computing RSI / ATR / Liquidity features")
-        ticks_df = pd.DataFrame([t.model_dump() for t in unified_ticks])
+        logger.info("[Gold] Computing SMC features (BOS/FVG/Liquidity)")
         ticks_df["timestamp_utc"] = pd.to_datetime(ticks_df["timestamp_utc"], utc=True)
 
         fe = FeatureEngineer()
@@ -108,31 +113,15 @@ async def run_pipeline(
         if not enriched.empty:
             fe.save_to_duckdb(enriched, store)
             logger.info(
-                f"[Gold] Features saved — {len(enriched):,} rows in tick_features"
+                f"[Gold] SMC features saved — {len(enriched):,} rows in tick_features"
             )
 
             # ── STRATEGY EXECUTION (Scout & Sniper) ───────────────────────
             logger.info("[Gold] Running Scout & Sniper strategy engine...")
-            # We close the store context first to ensure everything is flushed, 
-            # or we just call the runner within the same process if it handles its own connection.
-            # audit_logger.run_gold_layer() creates its own DuckDBStore connection.
-
-            # Print a quick sample
-            sample_cols = ["timestamp_utc", "bid", "ask", "rsi_14", "atr_14", "liq_level", "liq_type"]
-            available   = [c for c in sample_cols if c in enriched.columns]
-            non_null    = enriched[enriched["rsi_14"].notna()]
-            if not non_null.empty:
-                print("\n-- Sample of enriched ticks (first 5 with RSI) --")
-                print(non_null[available].head().to_string(index=False))
         else:
             logger.warning("[Gold] Feature engineering returned an empty DataFrame")
 
-        # Final counts
-        uc = store.get_tick_count("unified_ticks")
-        fc = store.get_tick_count("tick_features")
-        print(f"\n-- DuckDB totals: unified_ticks={uc:,}  tick_features={fc:,} --")
-
-    # Run strategy after store is closed to avoid lock issues
+    # Run strategy after store is closed
     await run_gold_layer(db_path=gold_db)
 
     logger.info("[Pipeline] Done.")
@@ -149,17 +138,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end",           required=True,    help="End date YYYY-MM-DD (inclusive)")
     parser.add_argument("--bronze-dir",    default="data/bronze", help="Bronze Parquet output dir")
     parser.add_argument("--gold-db",       default="data/gold/goldstream.duckdb", help="DuckDB path")
-    parser.add_argument("--skip-download", action="store_true",  help="Skip Bronze download, process existing Parquet")
+    parser.add_argument("--skip-download", action="store_true",  help="Skip Bronze download")
+    parser.add_argument("--skip-silver",   action="store_true",  help="Skip Silver processing (load from DuckDB)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     asyncio.run(run_pipeline(
-        symbol        = args.symbol,
-        start         = args.start,
-        end           = args.end,
-        bronze_dir    = args.bronze_dir,
-        gold_db       = args.gold_db,
-        skip_download = args.skip_download,
-    ))
+            symbol        = args.symbol,
+            start         = args.start,
+            end           = args.end,
+            bronze_dir    = args.bronze_dir,
+            gold_db       = args.gold_db,
+            skip_download = args.skip_download,
+            skip_silver   = args.skip_silver,
+        ))
