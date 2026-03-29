@@ -368,6 +368,8 @@ class FeatureEngineer:
         
         trends, hhs, lls, s_lows, s_highs = [None]*n, [None]*n, [None]*n, [None]*n, [None]*n
         bos_ev, choch_ev = [False]*n, [False]*n
+        bos_up_ev, bos_down_ev = [False]*n, [False]*n
+        choch_up_ev, choch_down_ev = [False]*n, [False]*n
         
         all_swings = sorted(swing_highs + swing_lows, key=lambda s: s.bar_time)
         sw_idx = 0
@@ -395,28 +397,41 @@ class FeatureEngineer:
 
             if trend == "bull" or trend is None:
                 if hh is not None and curr_c > hh:
-                    if trend == "bull": bos_ev[i] = True
+                    if trend == "bull":
+                        bos_ev[i] = True
+                        bos_up_ev[i] = True
                     trend = "bull"
                 elif strong_low is not None and curr_c < strong_low:
-                    choch_ev[i], trend, ll = True, "bear", curr_c
+                    choch_ev[i], choch_down_ev[i] = True, True
+                    trend, ll = "bear", curr_c
                     pre = [sh for sh in swing_highs if sh.bar_time < curr_t]
                     strong_high = max(p.price for p in pre) if pre else None
                     hh, strong_low = None, None
             elif trend == "bear":
                 if ll is not None and curr_c < ll:
                     bos_ev[i] = True
+                    bos_down_ev[i] = True
                 elif strong_high is not None and curr_c > strong_high:
-                    choch_ev[i], trend, hh = True, "bull", curr_c
+                    choch_ev[i], choch_up_ev[i] = True, True
+                    trend, hh = "bull", curr_c
                     pre = [sl for sl in swing_lows if sl.bar_time < curr_t]
                     strong_low = min(p.price for p in pre) if pre else None
                     ll, strong_high = None, None
             
             trends[i], hhs[i], lls[i], s_lows[i], s_highs[i] = trend, hh, ll, strong_low, strong_high
 
+        sh_times = set(s.bar_time for s in swing_highs)
+        sl_times = set(s.bar_time for s in swing_lows)
+        is_sh = [t in sh_times for t in times]
+        is_sl = [t in sl_times for t in times]
+
         return pd.DataFrame({
             "bar_time": times, "smc_trend_15m": trends, "hh_15m": hhs, "ll_15m": lls,
             "strong_low_15m": s_lows, "strong_high_15m": s_highs,
-            "bos_detected_15m": bos_ev, "choch_detected_15m": choch_ev
+            "bos_detected_15m": bos_ev, "choch_detected_15m": choch_ev,
+            "bos_up_15m": bos_up_ev, "bos_down_15m": bos_down_ev,
+            "choch_up_15m": choch_up_ev, "choch_down_15m": choch_down_ev,
+            "is_swing_high_15m": is_sh, "is_swing_low_15m": is_sl
         })
 
     def _compute_4h_market_bias(self, candles_4h: pd.DataFrame) -> pd.DataFrame:
@@ -515,41 +530,89 @@ class FeatureEngineer:
         return df
 
     def _merge_fvg_smc(self, enriched: pd.DataFrame, fvg_df: pd.DataFrame, candles_1m: pd.DataFrame) -> pd.DataFrame:
-        if fvg_df.empty:
+        if fvg_df.empty or candles_1m.empty:
             for col in ["fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars"]:
                 enriched[col] = None
             return enriched
 
-        enriched = enriched.copy()
-        f_highs, f_lows, f_sides = fvg_df["fvg_high"].values, fvg_df["fvg_low"].values, fvg_df["fvg_side"].values
-        f_times, f_filled = pd.to_datetime(fvg_df["formed_at"].values, utc=True), fvg_df["fvg_filled"].values
+        # Extract numpy arrays for speed
+        f_highs = fvg_df["fvg_high"].values
+        f_lows = fvg_df["fvg_low"].values
+        f_sides = fvg_df["fvg_side"].values
+        f_times = pd.to_datetime(fvg_df["formed_at"].values, utc=True)
+        f_filled = fvg_df["fvg_filled"].values
+
         b_times = pd.to_datetime(candles_1m["bar_time"].values, utc=True)
+        b_closes = candles_1m["bar_close"].values
+        n_bars = len(b_times)
 
-        o_high, o_low, o_side, o_filled, o_age = [], [], [], [], []
+        # Precompute FVG indices on the 1m timeline
+        f_idx = np.searchsorted(b_times, f_times, side="right")
+        f_mids = (f_highs + f_lows) / 2.0
 
-        for _, row in enriched.iterrows():
-            mid, t_time, trend = row["mid"], row["timestamp_utc"], row.get("smc_trend_15m")
-            valid = np.ones(len(fvg_df), dtype=bool)
-            for k in range(len(fvg_df)):
-                if f_filled[k] or f_times[k] >= t_time: valid[k] = False; continue
-                if (trend == "bull" and f_sides[k] != "bullish_fvg") or (trend == "bear" and f_sides[k] != "bearish_fvg"):
-                    valid[k] = False; continue
-                
-                f_idx = np.searchsorted(b_times, f_times[k], side="right")
-                t_idx = np.searchsorted(b_times, t_time, side="right")
-                if (t_idx - f_idx) > MAX_FVG_AGE_BARS: valid[k] = False
+        # Extract 15m trend mapped to 1m resolution
+        temp_1m = pd.DataFrame({"bar_time": b_times})
+        if "smc_trend_15m" in self.candles_15m.columns:
+            temp_1m = pd.merge_asof(
+                temp_1m, self.candles_15m[["bar_time", "smc_trend_15m"]].dropna(),
+                on="bar_time", direction="backward"
+            )
+        trends = temp_1m.get("smc_trend_15m", pd.Series([None]*n_bars)).values
+
+        o_high = np.full(n_bars, np.nan, dtype=float)
+        o_low  = np.full(n_bars, np.nan, dtype=float)
+        o_side = np.full(n_bars, None, dtype=object)
+        o_filled = np.zeros(n_bars, dtype=bool)
+        o_age  = np.zeros(n_bars, dtype=int)
+
+        n_fvgs = len(fvg_df)
+
+        for i in range(n_bars):
+            t_time = b_times[i]
+            trend = trends[i]
+            mid = b_closes[i]
+
+            valid = np.ones(n_fvgs, dtype=bool)
+            valid[f_filled] = False
+            valid[f_times >= t_time] = False
             
+            if trend == "bull": valid[f_sides != "bullish_fvg"] = False
+            elif trend == "bear": valid[f_sides != "bearish_fvg"] = False
+            else: valid[:] = False
+            
+            if not np.any(valid): continue
+
+            # Age is difference in 1m bar indices
+            age = (i + 1) - f_idx
+            valid[age > MAX_FVG_AGE_BARS] = False
+
+            if not np.any(valid): continue
+
             idx = np.where(valid)[0]
-            if len(idx) == 0:
-                for o in [o_high, o_low, o_side, o_filled, o_age]: o.append(None)
-                continue
-            
-            best = idx[np.argmin(np.abs((f_highs[idx] + f_lows[idx])/2.0 - mid))]
-            o_high.append(f_highs[best]); o_low.append(f_lows[best]); o_side.append(f_sides[best])
-            o_filled.append(False); o_age.append(int(np.searchsorted(b_times, t_time, side="right") - np.searchsorted(b_times, f_times[best], side="right")))
+            best = idx[np.argmin(np.abs(f_mids[idx] - mid))]
 
-        enriched["fvg_high"], enriched["fvg_low"], enriched["fvg_side"] = o_high, o_low, o_side
-        enriched["fvg_filled"], enriched["fvg_age_bars"] = o_filled, o_age
+            o_high[i] = f_highs[best]
+            o_low[i]  = f_lows[best]
+            o_side[i] = f_sides[best]
+            o_age[i]  = age[best]
+
+        # Put results back into a DataFrame mapping state at every 1m interval
+        fvg_states_1m = pd.DataFrame({
+            "timestamp_utc": b_times,
+            "fvg_high": o_high,
+            "fvg_low": o_low,
+            "fvg_side": o_side,
+            "fvg_filled": o_filled,
+            "fvg_age_bars": o_age
+        })
+
+        # Merge states onto the high-resolution tick DataFrame
+        enriched = pd.merge_asof(
+            enriched.sort_values("timestamp_utc"),
+            fvg_states_1m.sort_values("timestamp_utc"),
+            on="timestamp_utc", direction="backward"
+        )
+
         return enriched
 
     def _add_session_label(self, df: pd.DataFrame) -> pd.DataFrame:

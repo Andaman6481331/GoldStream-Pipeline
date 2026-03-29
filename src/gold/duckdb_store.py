@@ -123,6 +123,12 @@ class DuckDBStore:
                 strong_high_15m      DOUBLE,
                 bos_detected_15m     BOOLEAN,
                 choch_detected_15m   BOOLEAN,
+                bos_up_15m           BOOLEAN,
+                bos_down_15m         BOOLEAN,
+                choch_up_15m         BOOLEAN,
+                choch_down_15m       BOOLEAN,
+                is_swing_high_15m    BOOLEAN,
+                is_swing_low_15m     BOOLEAN,
                 market_bias_4h       VARCHAR,
 
                 PRIMARY KEY (timestamp_utc, symbol, source)
@@ -166,6 +172,12 @@ class DuckDBStore:
                 strong_high_15m      DOUBLE,
                 bos_detected_15m     BOOLEAN,
                 choch_detected_15m   BOOLEAN,
+                bos_up_15m           BOOLEAN,
+                bos_down_15m         BOOLEAN,
+                choch_up_15m         BOOLEAN,
+                choch_down_15m       BOOLEAN,
+                is_swing_high_15m    BOOLEAN,
+                is_swing_low_15m     BOOLEAN,
                 market_bias_4h       VARCHAR,
 
                 PRIMARY KEY (tick_time, symbol)
@@ -203,6 +215,13 @@ class DuckDBStore:
                 strong_high_15m     DOUBLE,
                 bos_detected_15m    BOOLEAN,
                 choch_detected_15m  BOOLEAN,
+                -- Directional signals
+                bos_up_15m          BOOLEAN,
+                bos_down_15m        BOOLEAN,
+                choch_up_15m        BOOLEAN,
+                choch_down_15m      BOOLEAN,
+                is_swing_high_15m   BOOLEAN,
+                is_swing_low_15m    BOOLEAN,
                 PRIMARY KEY (bar_time, symbol, source)
             )
         """)
@@ -267,7 +286,21 @@ class DuckDBStore:
         self._add_column_if_not_exists("tick_features", "strong_high_15m", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "bos_detected_15m", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "choch_detected_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "bos_up_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "bos_down_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "choch_up_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "choch_down_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "is_swing_high_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "is_swing_low_15m", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "market_bias_4h", "VARCHAR")
+
+        # candles_15m migrations
+        self._add_column_if_not_exists("candles_15m", "bos_up_15m", "BOOLEAN")
+        self._add_column_if_not_exists("candles_15m", "bos_down_15m", "BOOLEAN")
+        self._add_column_if_not_exists("candles_15m", "choch_up_15m", "BOOLEAN")
+        self._add_column_if_not_exists("candles_15m", "choch_down_15m", "BOOLEAN")
+        self._add_column_if_not_exists("candles_15m", "is_swing_high_15m", "BOOLEAN")
+        self._add_column_if_not_exists("candles_15m", "is_swing_low_15m", "BOOLEAN")
 
         self._add_column_if_not_exists("tick_features", "structure_direction", "VARCHAR")
         self._add_column_if_not_exists("tick_features", "bos_detected", "BOOLEAN")
@@ -352,7 +385,9 @@ class DuckDBStore:
             "prev_session_high", "prev_session_low", "session_boundary",
             "n_confirmed_swing_highs_15m", "n_confirmed_swing_lows_15m",
             "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
-            "bos_detected_15m", "choch_detected_15m", "market_bias_4h"
+            "bos_detected_15m", "choch_detected_15m", "market_bias_4h",
+            "bos_up_15m", "bos_down_15m", "choch_up_15m", "choch_down_15m",
+            "is_swing_high_15m", "is_swing_low_15m"
         ]
         # Only use columns that exist in the DataFrame
         available = [c for c in cols if c in df.columns]
@@ -400,7 +435,9 @@ class DuckDBStore:
             "prev_session_high", "prev_session_low", "session_boundary",
             "n_confirmed_swing_highs_15m", "n_confirmed_swing_lows_15m",
             "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
-            "bos_detected_15m", "choch_detected_15m", "market_bias_4h"
+            "bos_detected_15m", "choch_detected_15m", "market_bias_4h",
+            "bos_up_15m", "bos_down_15m", "choch_up_15m", "choch_down_15m",
+            "is_swing_high_15m", "is_swing_low_15m"
         ]
         # Ensure tick_time is a datetime object for DuckDB
         if isinstance(decision_data["tick_time"], str):

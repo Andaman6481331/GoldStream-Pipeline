@@ -9,6 +9,8 @@ import duckdb
 import pandas as pd
 import sys
 import logging
+import webbrowser
+import tempfile
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +35,8 @@ def run_visualizer(db_path="data/gold/goldstream.duckdb", symbol="XAUUSD", timef
             bar_open, bar_high, bar_low, bar_close, 
             smc_trend_15m, 
             bos_detected_15m, choch_detected_15m,
+            bos_up_15m, bos_down_15m, choch_up_15m, choch_down_15m,
+            is_swing_high_15m, is_swing_low_15m,
             hh_15m, ll_15m
         FROM {candle_table}
         WHERE symbol = '{symbol}'
@@ -77,25 +81,65 @@ def run_visualizer(db_path="data/gold/goldstream.duckdb", symbol="XAUUSD", timef
         decreasing_line_color='#ef5350'
     ))
 
-    # 4. Add Trace: BOS/CHoCH Markers
-    bos = df_candles[df_candles['bos_detected_15m'] == True]
-    if not bos.empty:
+    # 4. Add Trace: BOS/CHoCH and Swing Markers
+    # Swing Highs
+    sh = df_candles[df_candles['is_swing_high_15m'] == True]
+    if not sh.empty:
         fig.add_trace(go.Scatter(
-            x=bos['timestamp_utc'],
-            y=bos['bar_high'],
-            mode='markers',
-            marker=dict(symbol='triangle-up', size=12, color='royalblue'),
-            name="BOS (Break)"
+            x=sh['timestamp_utc'], y=sh['bar_high'] + 1.0,
+            mode='markers', marker=dict(symbol='triangle-down', size=8, color='rgba(239, 83, 80, 0.8)'),
+            name="Swing High"
+        ))
+        
+    # Swing Lows
+    sl = df_candles[df_candles['is_swing_low_15m'] == True]
+    if not sl.empty:
+        fig.add_trace(go.Scatter(
+            x=sl['timestamp_utc'], y=sl['bar_low'] - 1.0,
+            mode='markers', marker=dict(symbol='triangle-up', size=8, color='rgba(38, 166, 154, 0.8)'),
+            name="Swing Low"
         ))
 
-    choch = df_candles[df_candles['choch_detected_15m'] == True]
-    if not choch.empty:
+    # BOS Up
+    bos_up = df_candles[df_candles['bos_up_15m'] == True]
+    if not bos_up.empty:
         fig.add_trace(go.Scatter(
-            x=choch['timestamp_utc'],
-            y=choch['bar_high'],
-            mode='markers',
-            marker=dict(symbol='star', size=14, color='darkorchid'),
-            name="CHoCH (Reversal)"
+            x=bos_up['timestamp_utc'], y=bos_up['bar_high'] + 2.0,
+            mode='text', text="BOS ↑", textposition="top center",
+            textfont=dict(color='rgba(38, 166, 154, 1)', size=10, family="Arial Black"),
+            name="BOS Up"
+        ))
+
+    # BOS Down
+    bos_down = df_candles[df_candles['bos_down_15m'] == True]
+    if not bos_down.empty:
+        fig.add_trace(go.Scatter(
+            x=bos_down['timestamp_utc'], y=bos_down['bar_low'] - 2.0,
+            mode='text', text="BOS ↓", textposition="bottom center",
+            textfont=dict(color='rgba(239, 83, 80, 1)', size=10, family="Arial Black"),
+            name="BOS Down"
+        ))
+
+    # CHoCH Up
+    choch_up = df_candles[df_candles['choch_up_15m'] == True]
+    if not choch_up.empty:
+        fig.add_trace(go.Scatter(
+            x=choch_up['timestamp_utc'], y=choch_up['bar_low'] - 2.5,
+            mode='markers+text', text="CHoCH ↑", textposition="bottom center",
+            marker=dict(symbol='star', size=12, color='rgba(38, 166, 154, 1)'),
+            textfont=dict(color='rgba(38, 166, 154, 1)', size=11, family="Arial Black"),
+            name="CHoCH Up"
+        ))
+
+    # CHoCH Down
+    choch_down = df_candles[df_candles['choch_down_15m'] == True]
+    if not choch_down.empty:
+        fig.add_trace(go.Scatter(
+            x=choch_down['timestamp_utc'], y=choch_down['bar_high'] + 2.5,
+            mode='markers+text', text="CHoCH ↓", textposition="top center",
+            marker=dict(symbol='star', size=12, color='rgba(239, 83, 80, 1)'),
+            textfont=dict(color='rgba(239, 83, 80, 1)', size=11, family="Arial Black"),
+            name="CHoCH Down"
         ))
 
     # 5. Add Trace: FVG Zones (Visualized as boxes or lines)
@@ -109,19 +153,126 @@ def run_visualizer(db_path="data/gold/goldstream.duckdb", symbol="XAUUSD", timef
                 layer="below", line_width=0,
                 name=f"FVG {fvg['fvg_side']}"
             )
+            
+    # 5b. Highlight Background Trend Zones
+    # Identify contiguous blocks of "bull" or "bear" in smc_trend_15m
+    if 'smc_trend_15m' in df_candles.columns:
+        current_trend = None
+        trend_start = None
+        dfc = df_candles.dropna(subset=['smc_trend_15m', 'timestamp_utc'])
+        for i, row in dfc.iterrows():
+            trend = row['smc_trend_15m']
+            t_time = row['timestamp_utc']
+            
+            # Trend changed or starting
+            if trend != current_trend:
+                if current_trend in ['bull', 'bear']:
+                    # Close previous rect
+                    color = 'rgba(38, 166, 154, 0.1)' if current_trend == 'bull' else 'rgba(239, 83, 80, 0.1)'
+                    fig.add_vrect(
+                        x0=trend_start, x1=t_time,
+                        fillcolor=color, opacity=1,
+                        layer="below", line_width=0,
+                        name=f"Trend: {current_trend.upper()}"
+                    )
+                current_trend = trend
+                trend_start = t_time
+                
+        # Close the last open rect
+        if current_trend in ['bull', 'bear'] and trend_start is not None:
+            color = 'rgba(38, 166, 154, 0.1)' if current_trend == 'bull' else 'rgba(239, 83, 80, 0.1)'
+            fig.add_vrect(
+                x0=trend_start, x1=dfc.iloc[-1]['timestamp_utc'],
+                fillcolor=color, opacity=1,
+                layer="below", line_width=0,
+                name=f"Trend: {current_trend.upper()}"
+            )
 
     # 6. Formatting
     fig.update_layout(
         title=f"SMC Audit: {symbol} | 4H Bias: {market_bias.upper()}",
         template="plotly_dark",
-        xaxis_rangeslider_visible=True, # Added slider for easier navigation
+        xaxis_rangeslider_visible=True,
         yaxis_title="Price",
         xaxis_title="Time (UTC)",
-        yaxis=dict(autorange=True, fixedrange=False) # Auto-fit the price axis
+        yaxis=dict(
+            autorange=True, 
+            fixedrange=False,
+            tickmode='linear',
+            dtick=10, # Default interval
+            gridcolor='rgba(255,255,255,0.1)',
+            zerolinecolor='rgba(255,255,255,0.2)'
+        ),
+        margin=dict(l=50, r=50, t=80, b=50)
     )
 
-    logger.info("Opening browser for interactive audit...")
-    fig.show()
+    # 7. Add Interactive Scroll Logic via JS Injection
+    # We use fig.to_html and inject a small JS script to handle the wheel event
+    # for changing the price level interval (dtick).
+    config = {'scrollZoom': True, 'responsive': True}
+    html_content = fig.to_html(config=config, include_plotlyjs='cdn', full_html=True)
+    
+    js_interactive = """
+    <script>
+    window.addEventListener('load', function() {
+        const plotDiv = document.getElementsByClassName('plotly-graph-div')[0];
+        const intervals = [0.5, 1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000];
+        let currentIdx = 4; // Start at 10 (intervals[4])
+
+        // HUD for feedback
+        const hud = document.createElement('div');
+        hud.id = 'price-step-hud';
+        hud.style.position = 'fixed';
+        hud.style.top = '20px';
+        hud.style.right = '20px';
+        hud.style.background = 'rgba(38, 166, 154, 0.8)';
+        hud.style.color = 'white';
+        hud.style.padding = '8px 15px';
+        hud.style.borderRadius = '4px';
+        hud.style.fontFamily = 'monospace';
+        hud.style.fontSize = '14px';
+        hud.style.zIndex = '9999';
+        hud.style.pointerEvents = 'none';
+        hud.style.boxShadow = '0 2px 10px rgba(0,0,0,0.5)';
+        hud.innerHTML = 'STEP: 10 USD';
+        document.body.appendChild(hud);
+
+        function updateStep(delta) {
+            if (delta > 0) {
+                // Scroll down: decrease interval (more lines)
+                currentIdx = Math.max(0, currentIdx - 1);
+            } else {
+                // Scroll up: increase interval (less lines)
+                currentIdx = Math.min(intervals.length - 1, currentIdx + 1);
+            }
+            const newDtick = intervals[currentIdx];
+            Plotly.relayout(plotDiv, {'yaxis.dtick': newDtick});
+            hud.innerHTML = 'STEP: ' + newDtick + ' USD';
+            hud.style.background = 'rgba(239, 83, 80, 0.8)'; // Feedback color change
+            setTimeout(() => { hud.style.background = 'rgba(38, 166, 154, 0.8)'; }, 200);
+        }
+
+        plotDiv.on('wheel', function(e) {
+            // If they are holding Ctrl, let native zoom work
+            if (e.ctrlKey) return;
+            
+            // Otherwise, adjust price levels
+            e.preventDefault();
+            updateStep(e.deltaY);
+        }, {passive: false});
+    });
+    </script>
+    """
+    
+    html_content = html_content.replace('</body>', js_interactive + '</body>')
+
+    logger.info("Opening interactive audit in browser...")
+    
+    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.html') as f:
+        f.write(html_content)
+        temp_path = f.name
+    
+    webbrowser.open('file://' + temp_path)
 
 if __name__ == "__main__":
     import argparse

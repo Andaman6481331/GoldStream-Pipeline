@@ -23,6 +23,7 @@ import asyncio
 import struct
 import lzma
 import logging
+import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,9 @@ DUKASCOPY_CDN = "https://datafeed.dukascopy.com/datafeed"
 BI5_STRUCT_FMT = ">IIIff"       # big-endian: uint32, uint32, uint32, float32, float32
 BI5_ROW_SIZE = struct.calcsize(BI5_STRUCT_FMT)   # 20 bytes
 POINT_DIVISOR = 1000.0          # Adjusted for XAUUSD (2 or 3 decimal places)
+
+# Dukascopy CDN often blocks non-browser agents
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
 
 # Parquet schema for Bronze layer
 BRONZE_SCHEMA = pa.schema([
@@ -67,13 +71,14 @@ class HistoryDownloader:
         self,
         symbol: str = "XAUUSD",
         output_dir: str = "data/bronze",
-        max_concurrent: int = 5,
-        request_timeout: int = 45,
+        max_concurrent: int = 4, # Reduced from 8 to prevent 503s
+        request_timeout: int = 60,
     ):
         self.symbol = symbol.upper()
         self.output_dir = Path(output_dir)
         self.max_concurrent = max_concurrent
         self.timeout = aiohttp.ClientTimeout(total=request_timeout)
+        self.headers = {"User-Agent": USER_AGENT}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -107,7 +112,7 @@ class HistoryDownloader:
         semaphore = asyncio.Semaphore(self.max_concurrent)
         summary = {"ticks_saved": 0, "files_written": 0, "hours_skipped": 0}
 
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+        async with aiohttp.ClientSession(timeout=self.timeout, headers=self.headers) as session:
             tasks = [
                 self._fetch_hour(session, semaphore, hour_dt, summary)
                 for hour_dt in hours
@@ -141,8 +146,8 @@ class HistoryDownloader:
                             summary["hours_skipped"] += 1
                             return
                         if resp.status == 503:
-                            wait = (attempt + 1) * 2
-                            logger.warning(f"[HistoryDownloader] 503 for {hour_dt} - Retrying in {wait}s...")
+                            wait = (attempt + 1) * 5 + random.uniform(2, 5) # Increased wait + jitter
+                            logger.warning(f"[HistoryDownloader] 503 (Throttled) for {hour_dt} - Retrying in {wait:.1f}s...")
                             await asyncio.sleep(wait)
                             continue
                             

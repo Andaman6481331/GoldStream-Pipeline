@@ -65,7 +65,7 @@ async def run_pipeline(
         downloader = HistoryDownloader(
             symbol=symbol,
             output_dir=bronze_dir,
-            max_concurrent=8,
+            max_concurrent=4,
         )
         summary = await downloader.download_range(start, end)
         logger.info(
@@ -78,7 +78,7 @@ async def run_pipeline(
     # ── SILVER ────────────────────────────────────────────────────────────────
     logger.info("[Silver] Processing Parquet partitions → UnifiedTick")
     processor = SilverProcessor()
-    unified_ticks = list(processor.process_all_parquets(bronze_dir, symbol=symbol))
+    unified_ticks = list(processor.process_all_parquets(bronze_dir, symbol=symbol, start_date=start, end_date=end))
     logger.info(f"[Silver] Validated {len(unified_ticks):,} UnifiedTick rows")
 
     if not unified_ticks:

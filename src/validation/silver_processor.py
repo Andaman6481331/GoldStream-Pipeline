@@ -13,7 +13,7 @@ Key change vs v1:
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 import pandas as pd
 from pydantic import ValidationError
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ── Volume normalisation constants ────────────────────────────────────────────
 MT5_LOT_TO_USD        = 100_000      # 1 standard lot ≈ $100,000 notional
 DUKASCOPY_TO_USD      = 1_000_000    # Dukascopy volume unit = millions USD
-MIN_NOTIONAL_USD      = 1_000        # ticks below $1,000 notional are quote noise
+MIN_NOTIONAL_USD      = 0            # Set to 0 to capture all ticks (was 1,000)
 
 
 class SilverProcessor:
@@ -162,7 +162,9 @@ class SilverProcessor:
     # ── Batch helper ──────────────────────────────────────────────────────────
 
     def process_all_parquets(
-        self, bronze_dir: str | Path, symbol: str = "XAUUSD"
+        self, bronze_dir: str | Path, symbol: str = "XAUUSD",
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None
     ) -> Generator[UnifiedTick, None, None]:
         """
         Walk the entire Bronze partition tree for a symbol and yield all
@@ -171,8 +173,34 @@ class SilverProcessor:
         Layout: <bronze_dir>/<symbol>/year=*/month=*/ticks.parquet
         """
         bronze_dir = Path(bronze_dir)
-        pattern = f"{symbol}/year=*/month=*/ticks.parquet"
-        parquet_files = sorted(bronze_dir.glob(pattern))
+        parquet_files = []
+        
+        if start_date and end_date:
+            import pandas as pd
+            if isinstance(start_date, str):
+                start_date = pd.to_datetime(start_date)
+            if isinstance(end_date, str):
+                end_date = pd.to_datetime(end_date)
+                
+            # Get all months intersecting the requested range
+            months = pd.date_range(
+                start_date.replace(day=1), 
+                end_date, 
+                freq="MS"
+            ).union([start_date.replace(day=1)])
+            
+            for m in months:
+                tgt = bronze_dir / symbol / f"year={m.year}" / f"month={m.month:02d}" / "ticks.parquet"
+                if tgt.exists():
+                    parquet_files.append(tgt)
+                else: # Try without zero padding just in case
+                    tgt = bronze_dir / symbol / f"year={m.year}" / f"month={m.month}" / "ticks.parquet"
+                    if tgt.exists():
+                        parquet_files.append(tgt)
+            parquet_files = sorted(list(set(parquet_files)))
+        else:
+            pattern = f"{symbol}/year=*/month=*/ticks.parquet"
+            parquet_files = sorted(bronze_dir.glob(pattern))
 
         if not parquet_files:
             logger.warning(
