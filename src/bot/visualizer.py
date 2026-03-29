@@ -25,7 +25,7 @@ def run_visualizer(db_path="data/gold/goldstream.duckdb", symbol="XAUUSD", timef
         return
 
     logger.info(f"Connecting to {db_path} for {symbol} ({timeframe})...")
-    con = duckdb.connect(db_path)
+    con = duckdb.connect(db_path, read_only=True)
     
     # 1. Query Primary Candles (15m default)
     candle_table = "candles_15m" if timeframe == "15min" else "candles_1m"

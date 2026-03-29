@@ -54,29 +54,80 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
             saved = 0
             skipped = 0
 
+            # Track last acted-on 15m signal to prevent multi-fire triggers on every tick
+            # inside the same candle.
+            _last_bos_15m_bar = None
+            
+            # Track if T1 just hit SL (recovery relay)
+            _t1_stopped_out = False
+            
+            # For audit logging, we treat active trade slots as local boolean flags
+            # to ensure that build_context_from_row knows if a trade is "on".
+            _t1_active = False
+            _t2_active = False
+
             for _, row_series in rows_df.iterrows():
                 row = row_series.to_dict()
+                
+                ts = pd.to_datetime(row["timestamp_utc"])
+                current_15m_bar = ts.replace(minute=(ts.minute // 15) * 15, second=0, microsecond=0)
+                
+                # Reset structural signal deduplicator + recovery relay on new bar
+                if _last_bos_15m_bar != current_15m_bar:
+                    _last_bos_15m_bar = None
+                    _t1_stopped_out = False
+
                 # Build context
-                ctx: ScoutSniperContext = build_context_from_row(row)
+                ctx: ScoutSniperContext = build_context_from_row(row, t1_stopped_out=_t1_stopped_out)
+                ctx.t1_active = _t1_active
+                ctx.t2_active = _t2_active
+
+                # If we acted on a signal in this bar, suppress it from context
+                if _last_bos_15m_bar == current_15m_bar:
+                    ctx.bos_detected_15m = False
+                    ctx.choch_detected_15m = False
 
                 # Get decision
-                action: Action = make_decision(ctx)
-                decision_str = action.value
+                result: DecisionSummary = make_decision(ctx)
+                action: Action = result.action
+                reason: str = result.reason
 
+                # Update pseudo-state for logging
+                if action in (Action.OPEN_T1_LONG, Action.OPEN_T1_SHORT):
+                    _t1_active = True
+                    _last_bos_15m_bar = current_15m_bar
+                elif action == Action.CLOSE_T1:
+                    _t1_active = False
+                    # Audit assumption: if someone manually closes T1, it triggers Sniper possibility
+                    _t1_stopped_out = True 
+                elif action in (Action.OPEN_T2_LONG, Action.OPEN_T2_SHORT):
+                    _t2_active = True
+                    _t1_stopped_out = False
+                elif action == Action.CLOSE_T2:
+                    _t2_active = False
+                elif action == Action.CLOSE_ALL:
+                    _t1_active = False
+                    _t2_active = False
+                
                 # Skip HOLDs
                 if action == Action.HOLD:
                     skipped += 1
                     continue
+
+                decision_str = action.value
 
                 # Prepare decision record
                 decision_record = {
                     "symbol": row["symbol"],
                     "tick_time": row["timestamp_utc"],
                     "decision": decision_str,
+                    "reason": reason,
+                    "score": result.metadata.get("score"),
                     "mid": ctx.mid,
                     "bid": ctx.bid,
                     "ask": ctx.ask,
                     "session": ctx.session,
+                    "rsi_14": ctx.rsi_14,
                     "price_position": ctx.price_position,
                     "fvg_high": ctx.fvg_high,
                     "fvg_low": ctx.fvg_low,
@@ -103,6 +154,8 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                     "bos_detected_15m": ctx.bos_detected_15m,
                     "choch_detected_15m": ctx.choch_detected_15m,
                     "market_bias_4h": ctx.market_bias_4h,
+                    "liq_swept": ctx.liq_swept,
+                    "liq_side": ctx.liq_side
                 }
 
                 # Persist to DuckDB

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Literal, Optional, List, Dict, Union, Any, cas
 import numpy as np
 import pandas as pd
 from ta.volatility import AverageTrueRange
+from ta.momentum import RSIIndicator
 
 if TYPE_CHECKING:
     from src.gold.duckdb_store import DuckDBStore
@@ -195,12 +196,22 @@ class FeatureEngineer:
         # Step 7: FVG detection (1m)
         fvg_df = self._compute_fvg_smc(self.candles_1m)
 
+        # Step 7.5: Liquidity sweeps detection (1m)
+        self.candles_1m = self._compute_liquidity_sweeps_on_candles(self.candles_1m, self.swing_highs_15m, self.swing_lows_15m)
+
         # Step 8: Merge everything to tick resolution
         enriched = self._merge_smc_base(ticks_df, self.candles_1m, self.candles_15m)
         enriched = self._merge_session_levels(enriched, session_levels_df)
         enriched = self._merge_swing_counts(enriched, swing_count_df)
         enriched = self._merge_smc_structure(enriched, structure_df, self.candles_4h)
         enriched = self._merge_fvg_smc(enriched, fvg_df, self.candles_1m)
+        
+        # Merge liquidity swept status from 1m candles
+        enriched = pd.merge_asof(
+             enriched.sort_values("timestamp_utc"),
+             self.candles_1m[["bar_time", "liq_swept", "liq_side"]].sort_values("bar_time"),
+             left_on="timestamp_utc", right_on="bar_time", direction="backward"
+        ).drop(columns="bar_time", errors="ignore")
 
         # Step 9: Contextual metadata
         enriched = self._add_session_label(enriched)
@@ -224,7 +235,8 @@ class FeatureEngineer:
             "n_confirmed_swing_highs_15m", "n_confirmed_swing_lows_15m",
             "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
             "bos_detected_15m", "choch_detected_15m", "market_bias_4h",
-            "fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars", "session"
+            "fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars", "session",
+            "liq_swept", "liq_side", "rsi_14"
         ]
         available = [c for c in cols if c in df.columns]
         store.upsert_features(df[available])
@@ -257,6 +269,20 @@ class FeatureEngineer:
         candles[col] = AverageTrueRange(
             high=candles["bar_high"], low=candles["bar_low"], close=candles["bar_close"], window=period
         ).average_true_range()
+        
+        # 1. ATR (Vol)
+        self.candles_1m["atr_20_1m"] = AverageTrueRange(
+            high=self.candles_1m["bar_high"],
+            low=self.candles_1m["bar_low"],
+            close=self.candles_1m["bar_close"],
+            window=ATR_PERIOD_1M
+        ).average_true_range()
+
+        # 2. RSI (Momentum)
+        self.candles_1m["rsi_14"] = RSIIndicator(
+            close=self.candles_1m["bar_close"],
+            window=14
+        ).rsi()
         return candles
 
     def _build_session_levels(self, ticks_df: pd.DataFrame, candles_4h: pd.DataFrame) -> pd.DataFrame:
@@ -614,6 +640,58 @@ class FeatureEngineer:
         )
 
         return enriched
+
+    def _compute_liquidity_sweeps_on_candles(self, candles_1m, swing_highs, swing_lows):
+        """
+        Calculates if the current candle is piercing/sweeping a known structural swing point.
+        Uses 1m candles for memory efficiency and accurate 'close back' checking.
+        Option B mechanics with time-masking to prevent look-ahead bias.
+        """
+        if candles_1m.empty:
+            return candles_1m
+
+        n = len(candles_1m)
+        lows   = candles_1m["bar_low"].values
+        highs  = candles_1m["bar_high"].values
+        closes = candles_1m["bar_close"].values
+        times  = pd.to_datetime(candles_1m["bar_time"].values, utc=True).values
+
+        liq_swept = np.zeros(n, dtype=bool)
+        liq_side  = np.full(n, None, dtype=object)
+
+        if swing_highs:
+            sh_prices = np.array([sh.price for sh in swing_highs])
+            sh_times  = pd.to_datetime([sh.bar_time for sh in swing_highs], utc=True).values
+            
+            # Matrix broadcast (N_candles, M_swings)
+            # Look-ahead bias check: candle time MUST be strictly greater than swing confirm time
+            is_past = times[:, None] > sh_times[None, :]
+            
+            # Wick above high but close <= high = sweep
+            is_swept = (highs[:, None] > sh_prices[None, :]) & (closes[:, None] <= sh_prices[None, :])
+            
+            # Final mask
+            mask = np.any(is_past & is_swept, axis=1)
+            liq_swept[mask] = True
+            liq_side[mask] = "high"
+
+        if swing_lows:
+            sl_prices = np.array([sl.price for sl in swing_lows])
+            sl_times  = pd.to_datetime([sl.bar_time for sl in swing_lows], utc=True).values
+            
+            is_past = times[:, None] > sl_times[None, :]
+            
+            # Wick below low but close >= low = sweep
+            is_swept = (lows[:, None] < sl_prices[None, :]) & (closes[:, None] >= sl_prices[None, :])
+            
+            mask = np.any(is_past & is_swept, axis=1)
+            liq_swept[mask] = True
+            liq_side[mask] = "low"
+
+        res = candles_1m.copy()
+        res["liq_swept"] = liq_swept
+        res["liq_side"]  = liq_side
+        return res
 
     def _add_session_label(self, df: pd.DataFrame) -> pd.DataFrame:
         def label(ts):

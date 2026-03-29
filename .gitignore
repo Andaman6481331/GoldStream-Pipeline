@@ -29,3 +29,5 @@ data/
 *.duckdb
 *.duckdb.wal
 *.parquet
+
+tmp/

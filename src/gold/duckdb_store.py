@@ -35,11 +35,12 @@ class DuckDBStore:
         store.insert_unified_ticks(ticks)
     """
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH, read_only: bool = False):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._con: duckdb.DuckDBPyConnection = duckdb.connect(str(self.db_path))
-        logger.info(f"[DuckDBStore] Connected to {self.db_path}")
+        if not read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._con: duckdb.DuckDBPyConnection = duckdb.connect(str(self.db_path), read_only=read_only)
+        logger.info(f"[DuckDBStore] Connected to {self.db_path} (read_only={read_only})")
 
     # ── Schema ────────────────────────────────────────────────────────────────
 
@@ -140,6 +141,8 @@ class DuckDBStore:
                 symbol          VARCHAR     NOT NULL,
                 tick_time       TIMESTAMPTZ NOT NULL,
                 decision        VARCHAR     NOT NULL,
+                reason          VARCHAR,
+                score           INTEGER,
                 -- Context fields
                 mid             DOUBLE,
                 bid             DOUBLE,
@@ -179,6 +182,8 @@ class DuckDBStore:
                 is_swing_high_15m    BOOLEAN,
                 is_swing_low_15m     BOOLEAN,
                 market_bias_4h       VARCHAR,
+                liq_swept            BOOLEAN,
+                liq_side             VARCHAR,
 
                 PRIMARY KEY (tick_time, symbol)
             )
@@ -426,8 +431,8 @@ class DuckDBStore:
     def insert_trade_decision(self, decision_data: dict) -> None:
         """Persist a single trade decision into the trade_decisions table."""
         cols = [
-            "symbol", "tick_time", "decision", "mid", "bid", "ask",
-            "session", "price_position",
+            "symbol", "tick_time", "decision", "reason", "score",
+            "mid", "bid", "ask", "session", "rsi_14", "price_position",
             "fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars", "fvg_timestamp",
             "atr_20_1m", "atr_15_15m",
             "prev_day_high", "prev_day_low",
@@ -437,7 +442,8 @@ class DuckDBStore:
             "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
             "bos_detected_15m", "choch_detected_15m", "market_bias_4h",
             "bos_up_15m", "bos_down_15m", "choch_up_15m", "choch_down_15m",
-            "is_swing_high_15m", "is_swing_low_15m"
+            "is_swing_high_15m", "is_swing_low_15m",
+            "liq_swept", "liq_side"
         ]
         # Ensure tick_time is a datetime object for DuckDB
         if isinstance(decision_data["tick_time"], str):
