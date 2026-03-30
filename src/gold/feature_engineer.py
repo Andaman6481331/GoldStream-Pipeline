@@ -201,6 +201,7 @@ class FeatureEngineer:
 
         # Step 8: Merge everything to tick resolution
         enriched = self._merge_smc_base(ticks_df, self.candles_1m, self.candles_15m)
+        enriched = self._merge_15m_atr(enriched, self.candles_15m)  
         enriched = self._merge_session_levels(enriched, session_levels_df)
         enriched = self._merge_swing_counts(enriched, swing_count_df)
         enriched = self._merge_smc_structure(enriched, structure_df, self.candles_4h)
@@ -507,6 +508,27 @@ class FeatureEngineer:
         return pd.DataFrame(records)
 
     # ── Merge Helpers ──
+    def _merge_15m_atr(self, enriched: pd.DataFrame, candles_15m: pd.DataFrame) -> pd.DataFrame:
+        if candles_15m.empty or "atr_15_15m" not in candles_15m.columns:
+            enriched["atr_15_15m"] = np.nan
+            return enriched
+        
+        atr_df = (
+            candles_15m[["bar_time", "atr_15_15m"]]
+            .dropna(subset=["atr_15_15m"])
+            .query("atr_15_15m > 0")
+            .sort_values("bar_time")
+        )
+        
+        enriched = pd.merge_asof(
+            enriched.sort_values("timestamp_utc"),
+            atr_df,
+            left_on="timestamp_utc",
+            right_on="bar_time",
+            direction="backward"
+        ).drop(columns="bar_time", errors="ignore")
+        
+        return enriched
 
     def _merge_smc_base(self, ticks_df, c1m, c15m):
         enriched = pd.merge_asof(

@@ -12,7 +12,7 @@ DuckDB is chosen for:
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import duckdb
 import pandas as pd
@@ -475,6 +475,40 @@ class DuckDBStore:
               AND timestamp_utc <= ?
             ORDER BY timestamp_utc ASC
         """, [symbol, from_dt, to_dt]).df()
+
+    def query_candles_at(
+        self,
+        table: str,
+        symbol: str,
+        ts: datetime,
+    ) -> Optional[dict]:
+        """
+        Return the single 1m candle whose bar_time <= ts.
+        Used by BacktestEngine to get entry_candle_high/low for Point 1 calculation.
+        
+        Args:
+            table  : "candles_1m" | "candles_15m" | "candles_4h"
+            symbol : e.g. "XAUUSD"
+            ts     : tick timestamp at trade entry moment
+        """
+        result = self._con.execute(f"""
+            SELECT bar_open, bar_high, bar_low, bar_close
+            FROM {table}
+            WHERE symbol = ?
+            AND bar_time <= ?
+            ORDER BY bar_time DESC
+            LIMIT 1
+        """, [symbol, ts]).fetchone()
+
+        if result is None:
+            return None
+
+        return {
+            "bar_open":  result[0],
+            "bar_high":  result[1],
+            "bar_low":   result[2],
+            "bar_close": result[3],
+        }
 
     def get_liquidity_levels(
         self,

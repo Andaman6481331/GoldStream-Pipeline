@@ -368,7 +368,7 @@ class BacktestEngine:
             if self._last_bos_15m_bar != current_15m_bar:
                 # New 15m bar: reset the structural signal deduplicator 
                 # AND the recovery relay (no look-ahead/carryover of old failures)
-                self._last_bos_15m_bar = None
+                self._last_bos_15m_bar = current_15m_bar
                 self._t1_stopped_out = False
 
             if self._last_bos_15m_bar == current_15m_bar:
@@ -399,7 +399,7 @@ class BacktestEngine:
                 s1 = TradeState(type="T1", trade_pair_id=_current_pair_id)
                 self._open_trade(s1, Position.LONG, ask, ts, spread, target_atr, bar_high, bar_low)
                 s1.entry_reason = result.reason
-                s1.session = ctx.session or "Asian"
+                s1.session = ctx.session or "asian"
                 active_trades["T1"] = s1
                 _current_pair_id += 1 # New T1 starts a new pair
 
@@ -407,7 +407,7 @@ class BacktestEngine:
                 s1 = TradeState(type="T1", trade_pair_id=_current_pair_id)
                 self._open_trade(s1, Position.SHORT, bid, ts, spread, target_atr, bar_high, bar_low)
                 s1.entry_reason = result.reason
-                s1.session = ctx.session or "Asian"
+                s1.session = ctx.session or "asian"
                 active_trades["T1"] = s1
                 _current_pair_id += 1 # New T1 starts a new pair
 
@@ -415,7 +415,7 @@ class BacktestEngine:
                 s2 = TradeState(type="T2", trade_pair_id=_current_pair_id - 1)
                 self._open_trade(s2, Position.LONG, ask, ts, spread, target_atr, bar_high, bar_low)
                 s2.entry_reason = result.reason
-                s2.session = ctx.session or "Asian"
+                s2.session = ctx.session or "asian"
                 active_trades["T2"] = s2
                 self._t1_stopped_out = False # Reset: recovery sequence consumed
 
@@ -423,7 +423,7 @@ class BacktestEngine:
                 s2 = TradeState(type="T2", trade_pair_id=_current_pair_id - 1)
                 self._open_trade(s2, Position.SHORT, bid, ts, spread, target_atr, bar_high, bar_low)
                 s2.entry_reason = result.reason
-                s2.session = ctx.session or "Asian"
+                s2.session = ctx.session or "asian"
                 active_trades["T2"] = s2
                 self._t1_stopped_out = False # Reset: recovery sequence consumed
 
@@ -461,7 +461,7 @@ class BacktestEngine:
                 equity_curve.append(equity_curve[-1] + trade.pnl)
             active_trades.clear()
 
-        return self._compile_results(trades, len(ticks_df), equity_curve)
+        return self._compile_results(trades, len(ticks_df), equity_curve, gate_funnel)
 
     # ── Trade helpers ─────────────────────────────────────────────────────────
 
@@ -589,10 +589,10 @@ class BacktestEngine:
 
     # ── Results ───────────────────────────────────────────────────────────────
 
-    def _compile_results(self, trades: list[CompletedTrade], total_ticks: int, equity: list[float]) -> BacktestResult:
+    def _compile_results(self, trades: list[CompletedTrade], total_ticks: int, equity: list[float], gate_funnel: dict = None) -> BacktestResult:
         """Hydrate BacktestResult with categorical metrics."""
         if not trades:
-            return BacktestResult(total_ticks, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            return BacktestResult(total_ticks, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gate_funnel=gate_funnel or {})
 
         wins = [t for t in trades if t.pnl > 0]
         losses = [t for t in trades if t.pnl <= 0]
@@ -603,7 +603,7 @@ class BacktestEngine:
         t2_trades = [t for t in trades if t.type == "T2"]
         
         session_stats = {}
-        for sess in ["Asian", "london", "newyork"]:
+        for sess in ["asian", "london", "newyork"]:
             s_trades = [t for t in trades if t.session == sess]
             session_stats[sess] = {
                 "total": len(s_trades),
@@ -630,7 +630,8 @@ class BacktestEngine:
             t1_losses=len([t for t in t1_trades if t.pnl <= 0]),
             t2_wins=len([t for t in t2_trades if t.pnl > 0]),
             t2_losses=len([t for t in t2_trades if t.pnl <= 0]),
-            session_stats=session_stats
+            session_stats=session_stats,
+            gate_funnel=gate_funnel or {}
         )
 
 

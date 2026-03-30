@@ -238,8 +238,8 @@ def build_context_from_row(row: dict, t1_stopped_out: bool = False) -> ScoutSnip
         fvg_age_bars=_safe_int(row.get("fvg_age_bars")),
 
         # ── Phase 1 SMC ───────────────────────────────────────────────────
-        atr_20_1m=_safe_float(row.get("atr_20_1m")),
-        atr_15_15m=_safe_float(row.get("atr_15_15m")),
+        atr_20_1m=_safe_float(row.get("atr_20_1m")) or None,
+        atr_15_15m=_safe_float(row.get("atr_15_15m")) or None,
         rsi_14=_safe_float(row.get("rsi_14")),
         prev_day_high=_safe_float(row.get("prev_day_high")),
         prev_day_low=_safe_float(row.get("prev_day_low")),
