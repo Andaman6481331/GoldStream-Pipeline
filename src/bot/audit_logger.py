@@ -59,7 +59,7 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
             _last_bos_15m_bar = None
             
             # Track if T1 just hit SL (recovery relay)
-            _t1_stopped_out = False
+            _t1_stopped_at_loss = False
             
             # For audit logging, we treat active trade slots as local boolean flags
             # to ensure that build_context_from_row knows if a trade is "on".
@@ -75,10 +75,10 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                 # Reset structural signal deduplicator + recovery relay on new bar
                 if _last_bos_15m_bar != current_15m_bar:
                     _last_bos_15m_bar = None
-                    _t1_stopped_out = False
+                    _t1_stopped_at_loss = False
 
                 # Build context
-                ctx: ScoutSniperContext = build_context_from_row(row, t1_stopped_out=_t1_stopped_out)
+                ctx: ScoutSniperContext = build_context_from_row(row, t1_stopped_at_loss=_t1_stopped_at_loss)
                 ctx.t1_active = _t1_active
                 ctx.t2_active = _t2_active
 
@@ -99,10 +99,10 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                 elif action == Action.CLOSE_T1:
                     _t1_active = False
                     # Audit assumption: if someone manually closes T1, it triggers Sniper possibility
-                    _t1_stopped_out = True 
+                    _t1_stopped_at_loss = True 
                 elif action in (Action.OPEN_T2_LONG, Action.OPEN_T2_SHORT):
                     _t2_active = True
-                    _t1_stopped_out = False
+                    _t1_stopped_at_loss = False
                 elif action == Action.CLOSE_T2:
                     _t2_active = False
                 elif action == Action.CLOSE_ALL:

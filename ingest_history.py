@@ -60,13 +60,14 @@ async def run_pipeline(
     """
 
     # ── BRONZE ────────────────────────────────────────────────────────────────
+    downloader = HistoryDownloader(
+        symbol=symbol,
+        output_dir=bronze_dir,
+        max_concurrent=4,
+    )
+
     if not skip_download:
         logger.info(f"[Bronze] Starting download: {symbol} {start} → {end}")
-        downloader = HistoryDownloader(
-            symbol=symbol,
-            output_dir=bronze_dir,
-            max_concurrent=4,
-        )
         summary = await downloader.download_range(start, end)
         logger.info(
             f"[Bronze] Complete — {summary['ticks_saved']:,} ticks saved, "
@@ -74,6 +75,18 @@ async def run_pipeline(
         )
     else:
         logger.info("[Bronze] Skipping download (--skip-download flag set)")
+
+    # ── CONSOLIDATE ───────────────────────────────────────────────────────────
+    # Since HistoryDownloader v2+ writes hourly files, we must merge them
+    # into ticks.parquet for the SilverProcessor.
+    logger.info("[Bronze] Consolidating hourly files → month partitions")
+    months = pd.date_range(
+        start=pd.Timestamp(start).replace(day=1),
+        end=pd.Timestamp(end),
+        freq="MS"
+    )
+    for m in months:
+        downloader.merge_month(m.year, m.month)
 
     # ── SILVER ────────────────────────────────────────────────────────────────
     logger.info("[Silver] Processing Parquet partitions → UnifiedTick")

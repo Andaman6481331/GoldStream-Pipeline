@@ -1,29 +1,50 @@
 """
-Backtesting Engine — Event-Based  (v2)
-Iterates through enriched tick_features and fires a TickEvent callback
-for each tick, allowing strategy logic to access all v2 liquidity fields.
+Backtesting Engine — Event-Based  (v3)
+Iterates through enriched tick_features and drives the Scout & Sniper strategy.
 
-Fixes vs v1:
-  - pip_size corrected to 0.10 for XAUUSD (was 0.01 — 10x error)
-  - TickEvent expanded with all FeatureEngineer v2 fields
-  - _open_trade accepts ATR for dynamic stop sizing (1.5× ATR)
-  - strategy_fn now receives SMCContext (not just TickEvent) so
-    make_decision can be called directly from the engine
-  - BacktestResult adds Sharpe ratio and profit factor
-  - _check_liquidity_gap renamed _check_wide_spread (more accurate)
+Architecture:
+  - T1 (Scout)  : market order on BOS/CHoCH confirmation.
+  - T2 (Sniper) : PENDING limit order at FVG midpoint. Filled only when price
+                  reaches fvg_mid. Cancelled on FVG refill, timeout, or bias flip.
+  - Trailing SL : fractal-based on confirmed 1m swing points (L=R=3), one-way only.
+                  Activated ONLY after Point 2 is hit.
+  - Point 1     : moves SL to breakeven. Until Point 1 hit, original SL is live.
+  - Point 2     : activates the fractal trailing SL mechanic.
+  - SL (T1)     : sweep zone candle extreme ± T1_BUFFER_PIPS.
+  - SL (T2)     : fvg_low − T2_BUFFER_PIPS (long) / fvg_high + T2_BUFFER_PIPS (short).
+  - T2 TP       : optional structural TP at nearest Tier 1/2 level if R:R ≥ MIN_TP_RR.
+  - 1% rule     : T1 + T2 combined max loss ≤ 1% of account. Lot sized accordingly.
+
+Fixes vs v2:
+  - T2 is now a pending limit order, not a market fill (critical)
+  - Trailing SL is fractal swing-point based, not fixed-distance ratchet (critical)
+  - Point 1 → BE move and Point 2 → trail activation are actually enforced (critical)
+  - T1 SL uses sweep_candle extreme + T1_BUFFER_PIPS (critical)
+  - T2 SL uses fvg_low/high + T2_BUFFER_PIPS (critical)
+  - T2 structural TP implemented (critical)
+  - 1% combined max loss rule enforced via lot sizing (critical)
+  - _t1_stopped_out resets on T2 resolution only, not on bar boundary (high)
+  - BOS dedup fixed — only suppresses after a trade was actually taken (high)
+  - T2 fill uses fvg_mid from metadata, not live ask/bid (high)
+  - FVG-refill cancellation during T2 pending state (high)
+  - equity_curve updated on trailing stop closes (high)
+  - max_drawdown and sharpe_ratio calculated from equity curve (medium)
+  - PnL reported in both raw price units and dollar terms via lot size (medium)
+  - atr_14 fallback removed — atr_15_15m only, warn if missing (medium)
+  - List imported from typing (medium)
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
-
-
 
 if TYPE_CHECKING:
     from src.gold.duckdb_store import DuckDBStore
@@ -31,7 +52,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ── Enums ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy parameters  (all [BACKTEST] per spec — tune via backtesting)
+# ─────────────────────────────────────────────────────────────────────────────
+
+T1_BUFFER_PIPS   = 4.0    # SL buffer beyond sweep zone extreme
+T2_BUFFER_PIPS   = 2.5    # SL buffer beyond FVG boundary
+P1_ATR_FACTOR    = 0.3    # Point 1 = entry ± atr15_15m × this
+P2_ATR_FACTOR    = 1.25   # Point 2 = entry ± atr15_15m × this
+P2_P1_MIN_GAP    = 0.3    # Point 2 must be ≥ Point1 ± atr15_15m × this from Point 1
+TRAIL_BUFFER_PIPS = 2.5   # buffer below/above confirmed 1m swing point for trail SL
+MIN_TP_RR        = 2.0    # T2 structural TP only if R:R ≥ this
+T2_TIMEOUT_MS    = 10 * 60 * 1000   # 10 minutes in milliseconds
+MAX_ACCOUNT_RISK = 0.01   # 1% of account — combined T1+T2 max loss
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Enums
+# ─────────────────────────────────────────────────────────────────────────────
 
 class Position(Enum):
     FLAT  = "FLAT"
@@ -49,7 +87,9 @@ class Action(Enum):
     CLOSE_ALL     = "CLOSE_ALL"
 
 
-# ── Data classes ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class TickEvent:
@@ -57,7 +97,6 @@ class TickEvent:
     Full snapshot of a single tick passed to the strategy callback.
     All fields map 1-to-1 to tick_features columns.
     """
-    # Price
     timestamp_utc:  datetime
     symbol:         str
     bid:            float
@@ -67,17 +106,13 @@ class TickEvent:
     volume:         float
     volume_usd:     Optional[float]
 
-    # Indicators
     rsi_14:         Optional[float]
-    atr_14:         Optional[float]
 
-    # OHLC bar context
     bar_open:       Optional[float]
     bar_high:       Optional[float]
     bar_low:        Optional[float]
     bar_close:      Optional[float]
 
-    # Liquidity v2 fields
     liq_level:              Optional[float]
     liq_type:               Optional[str]
     liq_side:               Optional[str]
@@ -87,11 +122,9 @@ class TickEvent:
     dist_to_nearest_high:   Optional[float]
     dist_to_nearest_low:    Optional[float]
 
-    # Market context
     session:        Optional[str]
     price_position: Optional[str]
 
-    # Current trade state (read-only view)
     current_position:   Position        = Position.FLAT
     entry_price:        Optional[float] = None
     trailing_stop:      Optional[float] = None
@@ -100,51 +133,74 @@ class TickEvent:
 
 @dataclass
 class TradeState:
-    """Mutable state for a single active trade."""
-    type:           str                 = "T1" # "T1" | "T2"
-    trade_pair_id:  int                 = 0
-    position:       Position            = Position.FLAT
-    entry_price:    Optional[float]     = None
-    trailing_stop:  Optional[float]     = None
-    entry_time:     Optional[datetime]  = None
-    entry_spread:   Optional[float]     = None
-    peak_price:     Optional[float]     = None
+    """Mutable state for a single active (or pending) trade."""
+    type:           str             = "T1"       # "T1" | "T2"
+    trade_pair_id:  int             = 0
+    position:       Position        = Position.FLAT
+    entry_price:    Optional[float] = None
+    sl:             Optional[float] = None       # live stop-loss price
+    tp:             Optional[float] = None       # structural TP (T2 only; None = trail only)
+    entry_time:     Optional[datetime] = None
+    entry_spread:   Optional[float] = None
+    peak_price:     Optional[float] = None
 
-    # SMC Phase Tracking
-    point1_price:   float               = 0.0 # Breakeven trigger 
-    point2_price:   float               = 0.0 # Trailing activation
-    point1_reached: bool                = False
-    point2_reached: bool                = False
-    entry_reason:   str                 = ""
-    session:        str                 = ""
-    sl_pips:        float               = 0.0
+    # Entry candle extremes — for Point 1 calculation
+    entry_candle_high: float = 0.0
+    entry_candle_low:  float = 0.0
+
+    # Point 1 / Point 2 prices and status
+    point1_price:   float = 0.0
+    point2_price:   float = 0.0
+    point1_hit:     bool  = False   # True → SL moved to breakeven
+    point2_hit:     bool  = False   # True → fractal trailing SL activated
+
+    # Trailing SL state — only active after point2_hit
+    trailing_active: bool  = False
+
+    # T2 pending limit order fields
+    pending:        bool            = False
+    fvg_mid:        Optional[float] = None   # limit order price
+    fvg_low:        Optional[float] = None   # SL reference for T2 long
+    fvg_high:       Optional[float] = None   # SL reference for T2 short
+    expire_at_ms:   Optional[int]   = None   # unix ms — cancel if not filled by this
+
+    # Sizing
+    lot:            float = 0.01             # computed via 1% rule at entry
+    risk_distance:  float = 0.0             # abs(entry - sl), set once at entry
+
+    entry_reason:   str = ""
+    session:        str = ""
+    sl_pips:        float = 0.0
+    bos_direction:  str = ""                # "bull" | "bear" — stored at BOS time
 
 
 @dataclass
 class CompletedTrade:
     """Record of a completed round-trip trade."""
     symbol:           str
-    type:             str   # "T1" | "T2"
+    type:             str        # "T1" | "T2"
     trade_pair_id:    int
     direction:        Position
     entry_time:       datetime
     exit_time:        datetime
     entry_price:      float
     exit_price:       float
-    pnl:              float
+    pnl:              float      # raw price-unit PnL × lot (dollar-equivalent)
     pnl_pips:         float
-    exit_reason:      str   # "trailing_stop" | "strategy" | "wide_spread" | "end_of_data"
-    entry_reason:     str   # "BOS" | "CHoCH" | "LIQ_SWEEP"
+    pnl_raw:          float      # exit - entry in raw price units (for reference)
+    lot:              float
+    exit_reason:      str        # "sl" | "tp" | "trailing_stop" | "strategy" | "wide_spread" | "end_of_data"
+    entry_reason:     str        # "BOS" | "CHoCH" | "LIQ_SWEEP"
     session:          str
-    point1_reached:   bool
-    point2_reached:   bool
+    point1_hit:       bool
+    point2_hit:       bool
     hold_time_m:      float
     sl_pips_at_entry: float
 
 
 @dataclass
 class BacktestResult:
-    """Summary of a completed backtest run with categorical analysis."""
+    """Summary of a completed backtest run."""
     total_ticks:        int
     total_trades:       int
     winning_trades:     int
@@ -155,99 +211,98 @@ class BacktestResult:
     max_drawdown:       float
     profit_factor:      float
     sharpe_ratio:       float
-    trades:             list[CompletedTrade] = field(default_factory=list)
-    
-    # Advanced Metrics
-    t1_wins:            int = 0
-    t1_losses:          int = 0
-    t2_wins:            int = 0
-    t2_losses:          int = 0
-    gate_funnel:        dict = field(default_factory=dict)
-    session_stats:      dict = field(default_factory=dict)
+    trades:             List[CompletedTrade] = field(default_factory=list)
+
+    t1_wins:        int  = 0
+    t1_losses:      int  = 0
+    t2_wins:        int  = 0
+    t2_losses:      int  = 0
+    gate_funnel:    dict = field(default_factory=dict)
+    session_stats:  dict = field(default_factory=dict)
 
     def __str__(self) -> str:
-        res = [
-            "="*60,
+        def _wr(w, t): return f"{w/t:.1%}" if t > 0 else "n/a"
+        lines = [
+            "=" * 60,
             "  BACKTEST SUMMARY",
-            "="*60,
-            f"  Trades           : {self.total_trades} (Win Rate: {self.win_rate:.1%})",
+            "=" * 60,
+            f"  Trades           : {self.total_trades} (Win Rate: {_wr(self.winning_trades, self.total_trades)})",
             f"  Gross PnL        : {self.gross_pnl:+.2f}",
             f"  Profit Factor    : {self.profit_factor:.2f}",
-            f"  Sharpe Ratio     : {self.sharpe_ratio:.2f}",
+            f"  Sharpe Ratio     : {self.sharpe_ratio:.3f}",
+            f"  Max Drawdown     : {self.max_drawdown:.2f}",
             "",
             "  STRATEGY CATEGORIES",
-            "-"*30,
-            f"  T1 (Scout)  : {self.t1_wins + self.t1_losses:3d} trd | WR: {(self.t1_wins/(self.t1_wins+self.t1_losses) if (self.t1_wins+self.t1_losses)>0 else 0):.1%}",
-            f"  T2 (Sniper) : {self.t2_wins + self.t2_losses:3d} trd | WR: {(self.t2_wins/(self.t2_wins+self.t2_losses) if (self.t2_wins+self.t2_losses)>0 else 0):.1%}",
+            "-" * 30,
+            f"  T1 (Scout)  : {self.t1_wins + self.t1_losses:3d} trd | WR: {_wr(self.t1_wins, self.t1_wins + self.t1_losses)}",
+            f"  T2 (Sniper) : {self.t2_wins + self.t2_losses:3d} trd | WR: {_wr(self.t2_wins, self.t2_wins + self.t2_losses)}",
             "",
             "  T2 SNIPER FUNNEL (Rejections)",
-            "-"*30
+            "-" * 30,
         ]
         for reason, count in self.gate_funnel.items():
-            res.append(f"  {reason:25s}: {count}")
-        
-        res.append("")
-        res.append("  SESSION PERFORMANCE")
-        res.append("-"*30)
+            lines.append(f"  {reason:30s}: {count}")
+        lines += [
+            "",
+            "  SESSION PERFORMANCE",
+            "-" * 30,
+        ]
         for sess, stats in self.session_stats.items():
-            wr = (stats['wins']/stats['total'] if stats['total']>0 else 0)
-            res.append(f"  {sess:10s}: {stats['total']:3d} trd | WR: {wr:.1%}")
-            
-        res.append("="*60)
-        return "\n".join(res)
+            lines.append(
+                f"  {sess:10s}: {stats['total']:3d} trd | WR: {_wr(stats['wins'], stats['total'])}"
+            )
+        lines.append("=" * 60)
+        return "\n".join(lines)
 
 
-# ── Engine ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine
+# ─────────────────────────────────────────────────────────────────────────────
 
 class BacktestEngine:
     """
-    Event-based backtesting engine.
+    Event-based backtesting engine for the Scout & Sniper strategy.
 
-    Feeds enriched tick_features rows to make_decision one tick at a time,
-    managing trade state, trailing stops, and performance accounting.
+    Trade mechanics:
+      T1 — market order at BOS/CHoCH confirmation tick.
+      T2 — pending limit order at fvg_mid; filled only when price touches the
+           limit level. Cancelled on FVG refill, T2_TIMEOUT, or bias flip.
+      SL — structural for both trades (not ATR-generic).
+      Trailing — fractal 1m swing-point based, activated only after Point 2.
+      Lot sizing — 1% account risk rule, T1 + T2 combined.
 
     Usage:
-        engine = BacktestEngine(
-            store=store,
-            symbol="XAUUSD",
-            trailing_stop_pips=50,
-            wide_spread_pips=30,
-        )
-        result = engine.run(
-            from_dt=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            to_dt=datetime(2024, 12, 31, tzinfo=timezone.utc),
-        )
+        engine = BacktestEngine(store=store, symbol="XAUUSD")
+        result = engine.run(from_dt=..., to_dt=...)
         print(result)
     """
 
-    PIP_SIZE = 0.10   # XAUUSD: 1 pip = $0.10. NOT $0.01
+    PIP_SIZE         = 0.10    # XAUUSD: 1 pip = $0.10
+    LOT_PIP_VALUE    = 10.0    # $10 per pip per standard lot (100 oz)
+    WIDE_SPREAD_PIPS = 20.0    # force-close threshold
 
     def __init__(
         self,
-        store: DuckDBStore,
-        symbol: str = "XAUUSD",
-        initial_capital: float = 10000.0,
-        trailing_stop_pips: float = 30.0,
-        wide_spread_pips: float = 20.0,
-        atr_stop_multiplier: float = 1.5,
+        store:           "DuckDBStore",
+        symbol:          str   = "XAUUSD",
+        initial_capital: float = 10_000.0,
     ):
-        self.store = store
-        self.symbol = symbol
+        self.store           = store
+        self.symbol          = symbol
         self.initial_capital = initial_capital
-        
-        self.trailing_stop_pips = trailing_stop_pips
-        self.wide_spread_pips = wide_spread_pips
-        self.atr_stop_multiplier = atr_stop_multiplier
 
-        # Track the last structural signal timeframe to suppress multi-fire 
-        # triggers within the same 15m candle.
-        self._last_bos_15m_bar: Optional[datetime] = None
+        # BOS deduplication: set ONLY after a trade was actually opened.
+        # Never reset on a bare bar boundary — only reset when a new T1 opens.
+        self._bos_taken_bar: Optional[datetime] = None
 
-        # Recovery relay: True if a T1 Scout just failed at a loss (pnl < 0).
-        # This enables Phase 3 (Sniper T2) for the current structural sequence.
-        self._t1_stopped_out: bool = False
-        
-        self.trades: List[CompletedTrade] = []
+        # Recovery relay — True from T1 real loss until T2 resolves.
+        # Reset on: T2 fill, T2 cancel (timeout/refill/bias), or new T1 open.
+        self._t1_stopped_at_loss: bool = False
+
+        # BOS context stored at T1 fire time — relayed to strategy for Gate 3.
+        self._bos_direction:    Optional[str] = None
+        self._bos_time_ms:      Optional[int] = None
+        self._r_dynamic_at_bos: Optional[int] = None
 
     # ── Data loading ──────────────────────────────────────────────────────────
 
@@ -264,19 +319,13 @@ class BacktestEngine:
 
     def run(
         self,
-        from_dt:  Optional[datetime]       = None,
-        to_dt:    Optional[datetime]       = None,
-        ticks_df: Optional[pd.DataFrame]  = None,
+        from_dt:  Optional[datetime]      = None,
+        to_dt:    Optional[datetime]      = None,
+        ticks_df: Optional[pd.DataFrame] = None,
     ) -> BacktestResult:
         """
-        Main backtest loop. strategy_fn is no longer a parameter — the engine
-        calls make_decision directly via build_context_from_row so that the
-        backtest and live runner use exactly the same decision code path.
-
-        Args:
-            from_dt   : Start datetime (used if ticks_df not supplied).
-            to_dt     : End datetime.
-            ticks_df  : Pre-loaded DataFrame (bypasses DuckDB — useful in tests).
+        Main backtest loop. Calls make_decision each tick and manages the full
+        trade lifecycle including T2 pending-order state.
         """
         if ticks_df is None:
             if from_dt is None or to_dt is None:
@@ -287,183 +336,344 @@ class BacktestEngine:
             logger.error("[BacktestEngine] No ticks — aborting")
             return BacktestResult(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-        active_trades:  dict[str, TradeState] = {} # Keyed by "T1", "T2"
-        trades:         list[CompletedTrade] = []
-        equity_curve:   list[float]          = [0.0]
+        from src.bot.strategy_scout_sniper import build_context_from_row, make_decision
 
-        # Analytics State
-        _current_pair_id = 1
-        gate_funnel     = {}  # Track why T2 was blocked
-        
+        active_trades: Dict[str, TradeState] = {}   # "T1" | "T2"
+        trades:        List[CompletedTrade]  = []
+        equity_curve:  List[float]           = [self.initial_capital]
+        gate_funnel:   Dict[str, int]        = {}
+        _pair_id = 1
+
         logger.info(f"[BacktestEngine] Starting run over {len(ticks_df):,} ticks")
 
         for _, row in ticks_df.iterrows():
-            row_dict  = dict(row)
-            bid       = float(row_dict.get("bid",  0.0))
-            ask       = float(row_dict.get("ask",  0.0))
-            mid       = (bid + ask) / 2.0
-            spread    = ask - bid
-            ts        = pd.Timestamp(row_dict["timestamp_utc"]).to_pydatetime()
-            
-            # Default to 14-period ATR for backward compatibility,
-            # but prefer specialized structural ATR when available in context.
-            atr_14    = _safe_float(row_dict.get("atr_14"))
+            row_dict = dict(row)
+            bid      = _safe_float(row_dict.get("bid"))  or 0.0
+            ask      = _safe_float(row_dict.get("ask"))  or 0.0
+            mid      = (bid + ask) / 2.0
+            spread   = ask - bid
+            ts       = pd.Timestamp(row_dict["timestamp_utc"]).to_pydatetime()
+            ts_ms    = int(ts.timestamp() * 1000)
 
-            # ── Trade life-cycle management (all active trades) ───────────
-            to_remove = []
-            for tid, tstate in active_trades.items():
-                # Wide spread — force close
-                if self._is_wide_spread(spread):
+            # Current account equity for lot sizing
+            current_equity = equity_curve[-1]
+
+            # ── Wide spread — force-close all active trades ───────────────
+            if self._is_wide_spread(spread):
+                for tid in list(active_trades.keys()):
+                    tstate = active_trades.pop(tid)
+                    if tstate.pending:
+                        continue    # pending order — just drop it
                     trade = self._close_trade(tstate, bid, ask, ts, "wide_spread")
                     trades.append(trade)
                     equity_curve.append(equity_curve[-1] + trade.pnl)
-                    to_remove.append(tid)
-                    continue
-
-                # Trailing stop hit
-                if self._check_trailing_stop(tstate, bid, ask):
-                    trade = self._close_trade(tstate, bid, ask, ts, "trailing_stop")
-                    trades.append(trade)
-                    # Relay outcome to strategy context before removing
                     if tstate.type == "T1":
-                        # T2 recovery triggers ONLY if T1 took a net loss
-                        # (Scenario 5, 6, 7 in documentation)
-                        self._t1_stopped_out = (trade.pnl < 0)
-                        
+                        self._t1_stopped_at_loss = trade.pnl < 0
+                continue
+
+            # ── T2 pending order management ───────────────────────────────
+            if "T2" in active_trades and active_trades["T2"].pending:
+                t2 = active_trades["T2"]
+                cancelled = False
+
+                # 1. Timeout
+                if ts_ms >= t2.expire_at_ms:
+                    logger.debug(f"[BacktestEngine] T2 cancelled: timeout")
+                    active_trades.pop("T2")
+                    self._t1_stopped_at_loss = False
+                    cancelled = True
+
+                # 2. Bias flip
+                if not cancelled:
+                    live_bias = row_dict.get("market_bias_4h")
+                    if live_bias and live_bias != "neutral":
+                        bias_flipped = (
+                            (t2.bos_direction == "bull" and live_bias == "bearish") or
+                            (t2.bos_direction == "bear" and live_bias == "bullish")
+                        )
+                        if bias_flipped:
+                            logger.debug(f"[BacktestEngine] T2 cancelled: bias flip")
+                            active_trades.pop("T2")
+                            self._t1_stopped_at_loss = False
+                            cancelled = True
+
+                # 3. FVG refilled — price closed back through the gap
+                if not cancelled:
+                    bar_close = _safe_float(row_dict.get("bar_close"))
+                    if bar_close is not None:
+                        fvg_refilled = _safe_bool(row_dict.get("fvg_filled"))
+                        if fvg_refilled:
+                            logger.debug(f"[BacktestEngine] T2 cancelled: FVG refilled")
+                            active_trades.pop("T2")
+                            self._t1_stopped_at_loss = False
+                            cancelled = True
+
+                # 4. Price reached limit — fill at fvg_mid
+                if not cancelled and t2.fvg_mid is not None:
+                    filled = (
+                        (t2.position == Position.LONG  and ask <= t2.fvg_mid) or
+                        (t2.position == Position.SHORT and bid >= t2.fvg_mid)
+                    )
+                    if filled:
+                        fill_price = t2.fvg_mid
+                        self._activate_pending_t2(
+                            t2, fill_price, ts, spread,
+                            row_dict, current_equity,
+                        )
+                        logger.debug(
+                            f"[BacktestEngine] T2 FILLED at {fill_price:.5f}"
+                        )
+                        self._t1_stopped_at_loss = False
+
+            # ── Active trade lifecycle ────────────────────────────────────
+            to_remove: List[str] = []
+            for tid, tstate in active_trades.items():
+                if tstate.pending:
+                    continue    # handled above
+
+                # SL hit
+                sl_hit = (
+                    (tstate.position == Position.LONG  and bid <= tstate.sl) or
+                    (tstate.position == Position.SHORT and ask >= tstate.sl)
+                )
+                if sl_hit:
+                    trade = self._close_trade(tstate, bid, ask, ts, "sl")
+                    trades.append(trade)
+                    equity_curve.append(equity_curve[-1] + trade.pnl)
+                    if tstate.type == "T1":
+                        # T2 recovery only if T1 stopped BEFORE Point 1 (real loss)
+                        self._t1_stopped_at_loss = (not tstate.point1_hit) and (trade.pnl < 0)
                     to_remove.append(tid)
                     continue
 
-                # Ratchet trailing stop
-                self._update_trailing_stop(tstate, bid, ask)
+                # TP hit (T2 structural TP only — T1 has no TP)
+                if tstate.tp is not None:
+                    tp_hit = (
+                        (tstate.position == Position.LONG  and bid >= tstate.tp) or
+                        (tstate.position == Position.SHORT and ask <= tstate.tp)
+                    )
+                    if tp_hit:
+                        trade = self._close_trade(tstate, bid, ask, ts, "tp")
+                        trades.append(trade)
+                        equity_curve.append(equity_curve[-1] + trade.pnl)
+                        to_remove.append(tid)
+                        continue
 
-                # ── Phase Monitoring (NEW) ──────────────────────────────────
-                # Point 1: Breakeven Trigger (Entry High + ATR buffer)
-                if not tstate.point1_reached:
-                    if tstate.position == Position.LONG and bid >= tstate.point1_price:
-                        tstate.point1_reached = True
-                    elif tstate.position == Position.SHORT and ask <= tstate.point1_price:
-                        tstate.point1_reached = True
-                
-                # Point 2: Trailing Activation 
-                if not tstate.point2_reached:
-                    if tstate.position == Position.LONG and bid >= tstate.point2_price:
-                        tstate.point2_reached = True
-                    elif tstate.position == Position.SHORT and ask <= tstate.point2_price:
-                        tstate.point2_reached = True
+                # Point 1 — move SL to breakeven (once only)
+                if not tstate.point1_hit:
+                    p1_hit = (
+                        (tstate.position == Position.LONG  and bid >= tstate.point1_price) or
+                        (tstate.position == Position.SHORT and ask <= tstate.point1_price)
+                    )
+                    if p1_hit:
+                        tstate.point1_hit = True
+                        tstate.sl = tstate.entry_price   # move to breakeven
+                        logger.debug(
+                            f"[BacktestEngine] {tid} Point 1 hit — SL moved to BE @ {tstate.sl:.5f}"
+                        )
+
+                # Point 2 — activate fractal trailing SL
+                if tstate.point1_hit and not tstate.point2_hit:
+                    p2_hit = (
+                        (tstate.position == Position.LONG  and bid >= tstate.point2_price) or
+                        (tstate.position == Position.SHORT and ask <= tstate.point2_price)
+                    )
+                    if p2_hit:
+                        tstate.point2_hit     = True
+                        tstate.trailing_active = True
+                        logger.debug(
+                            f"[BacktestEngine] {tid} Point 2 hit — fractal trail activated"
+                        )
+
+                # Fractal trailing SL update — only after Point 2 activated
+                if tstate.trailing_active:
+                    self._update_fractal_trail(tstate, row_dict)
 
             for tid in to_remove:
                 active_trades.pop(tid, None)
 
             # ── Strategy decision ─────────────────────────────────────────
-            from src.bot.strategy_scout_sniper import build_context_from_row, make_decision
-            ctx = build_context_from_row(row_dict, t1_stopped_out=self._t1_stopped_out)
-            
-            # Inject current trade status
-            ctx.t1_active = ("T1" in active_trades)
-            ctx.t2_active = ("T2" in active_trades)
-            # ── Deduplicate 15m Structural Signals ─────────────────────────
-            # The tick timestamp floored to the nearest 15-minute start time
-            current_15m_bar = ts.replace(minute=(ts.minute // 15) * 15, second=0, microsecond=0)
-            
-            if self._last_bos_15m_bar != current_15m_bar:
-                # New 15m bar: reset the structural signal deduplicator 
-                # AND the recovery relay (no look-ahead/carryover of old failures)
-                self._last_bos_15m_bar = current_15m_bar
-                self._t1_stopped_out = False
+            current_15m_bar = ts.replace(
+                minute=(ts.minute // 15) * 15, second=0, microsecond=0
+            )
 
-            if self._last_bos_15m_bar == current_15m_bar:
-                # We already acted on a structural signal inside this bar timeframe
-                ctx.bos_detected_15m = False
+            ctx = build_context_from_row(
+                row_dict,
+                t1_stopped_at_loss=self._t1_stopped_at_loss,
+                t1_active=("T1" in active_trades),
+                t2_active=("T2" in active_trades),
+                bos_direction=self._bos_direction,
+                bos_time_ms=self._bos_time_ms,
+                r_dynamic_at_bos=self._r_dynamic_at_bos,
+            )
+
+            # BOS/CHoCH dedup — suppress signals only if we ALREADY took a trade
+            # in this 15m bar. Do NOT suppress on a bare bar-boundary crossing.
+            if self._bos_taken_bar == current_15m_bar:
+                ctx.bos_detected_15m  = False
                 ctx.choch_detected_15m = False
 
-            # Execute Strategy 
             result = make_decision(ctx)
             action = result.action
 
-            # Track T2 Funnel (rejections)
-            if self._t1_stopped_out and action == Action.HOLD and "T2" not in active_trades:
+            # Track T2 funnel rejections
+            if self._t1_stopped_at_loss and action == Action.HOLD and "T2" not in active_trades:
                 reason = result.reason
                 if reason.startswith("REASON_"):
                     gate_funnel[reason] = gate_funnel.get(reason, 0) + 1
 
-            # Prepare common entry data
-            target_atr = ctx.atr_15_15m or atr_14
-            bar_high   = row_dict.get("bar_high", mid)
-            bar_low    = row_dict.get("bar_low", mid)
+            # Retrieve bar context for SL and Point calculations
+            bar_high = _safe_float(row_dict.get("bar_high")) or mid
+            bar_low  = _safe_float(row_dict.get("bar_low"))  or mid
+            atr_15m  = _safe_float(row_dict.get("atr_15_15m"))
+            if atr_15m is None or atr_15m <= 0:
+                logger.warning("[BacktestEngine] atr_15_15m missing — skipping tick for SL calc")
+                atr_15m = None
 
-            # Record the execution bar if we take a structural trade
-            if action in (Action.OPEN_T1_LONG, Action.OPEN_T1_SHORT):
-                self._last_bos_15m_bar = current_15m_bar
+            # ── Execute action ────────────────────────────────────────────
 
             if action == Action.OPEN_T1_LONG and "T1" not in active_trades:
-                s1 = TradeState(type="T1", trade_pair_id=_current_pair_id)
-                self._open_trade(s1, Position.LONG, ask, ts, spread, target_atr, bar_high, bar_low)
-                s1.entry_reason = result.reason
-                s1.session = ctx.session or "asian"
-                active_trades["T1"] = s1
-                _current_pair_id += 1 # New T1 starts a new pair
+                sl_price = self._calc_t1_sl(row_dict, Position.LONG)
+                if sl_price is None or atr_15m is None:
+                    logger.debug("[BacktestEngine] T1 long skipped: no sweep SL or ATR")
+                else:
+                    lot = self._size_lot(ask, sl_price, current_equity, trade_type="T1")
+                    s1  = TradeState(type="T1", trade_pair_id=_pair_id,
+                                     bos_direction="bull")
+                    self._open_trade(
+                        s1, Position.LONG, ask, ts, spread,
+                        sl_price, atr_15m, bar_high, bar_low, lot,
+                    )
+                    s1.entry_reason = result.reason
+                    s1.session      = ctx.session or "asian"
+                    active_trades["T1"] = s1
+                    # Store BOS context for Gate 3 relay
+                    self._bos_direction    = "bull"
+                    self._bos_time_ms      = ts_ms
+                    self._r_dynamic_at_bos = _safe_int(row_dict.get("r_dynamic"))
+                    self._bos_taken_bar    = current_15m_bar
+                    self._t1_stopped_at_loss = False
+                    _pair_id += 1
 
             elif action == Action.OPEN_T1_SHORT and "T1" not in active_trades:
-                s1 = TradeState(type="T1", trade_pair_id=_current_pair_id)
-                self._open_trade(s1, Position.SHORT, bid, ts, spread, target_atr, bar_high, bar_low)
-                s1.entry_reason = result.reason
-                s1.session = ctx.session or "asian"
-                active_trades["T1"] = s1
-                _current_pair_id += 1 # New T1 starts a new pair
+                sl_price = self._calc_t1_sl(row_dict, Position.SHORT)
+                if sl_price is None or atr_15m is None:
+                    logger.debug("[BacktestEngine] T1 short skipped: no sweep SL or ATR")
+                else:
+                    lot = self._size_lot(bid, sl_price, current_equity, trade_type="T1")
+                    s1  = TradeState(type="T1", trade_pair_id=_pair_id,
+                                     bos_direction="bear")
+                    self._open_trade(
+                        s1, Position.SHORT, bid, ts, spread,
+                        sl_price, atr_15m, bar_high, bar_low, lot,
+                    )
+                    s1.entry_reason = result.reason
+                    s1.session      = ctx.session or "asian"
+                    active_trades["T1"] = s1
+                    self._bos_direction    = "bear"
+                    self._bos_time_ms      = ts_ms
+                    self._r_dynamic_at_bos = _safe_int(row_dict.get("r_dynamic"))
+                    self._bos_taken_bar    = current_15m_bar
+                    self._t1_stopped_at_loss = False
+                    _pair_id += 1
 
             elif action == Action.OPEN_T2_LONG and "T2" not in active_trades:
-                s2 = TradeState(type="T2", trade_pair_id=_current_pair_id - 1)
-                self._open_trade(s2, Position.LONG, ask, ts, spread, target_atr, bar_high, bar_low)
-                s2.entry_reason = result.reason
-                s2.session = ctx.session or "asian"
-                active_trades["T2"] = s2
-                self._t1_stopped_out = False # Reset: recovery sequence consumed
+                # T2 is a PENDING limit order — not filled until price reaches fvg_mid
+                meta      = result.metadata
+                fvg_mid   = _safe_float(meta.get("fvg_mid"))
+                fvg_low   = _safe_float(meta.get("fvg_low"))
+                fvg_high  = _safe_float(meta.get("fvg_high"))
+                expire_at = meta.get("expire_at")
+
+                if fvg_mid is None or fvg_low is None:
+                    logger.debug("[BacktestEngine] T2 long skipped: no fvg_mid in metadata")
+                else:
+                    sl_price = fvg_low - (T2_BUFFER_PIPS * self.PIP_SIZE)
+                    lot      = self._size_lot(fvg_mid, sl_price, current_equity, trade_type="T2")
+                    s2       = TradeState(
+                        type="T2", trade_pair_id=_pair_id - 1,
+                        position=Position.LONG,
+                        pending=True,
+                        fvg_mid=fvg_mid,
+                        fvg_low=fvg_low,
+                        fvg_high=fvg_high,
+                        expire_at_ms=expire_at or (ts_ms + T2_TIMEOUT_MS),
+                        sl=sl_price,
+                        lot=lot,
+                        bos_direction="bull",
+                    )
+                    s2.entry_reason = result.reason
+                    s2.session      = ctx.session or "asian"
+                    active_trades["T2"] = s2
 
             elif action == Action.OPEN_T2_SHORT and "T2" not in active_trades:
-                s2 = TradeState(type="T2", trade_pair_id=_current_pair_id - 1)
-                self._open_trade(s2, Position.SHORT, bid, ts, spread, target_atr, bar_high, bar_low)
-                s2.entry_reason = result.reason
-                s2.session = ctx.session or "asian"
-                active_trades["T2"] = s2
-                self._t1_stopped_out = False # Reset: recovery sequence consumed
+                meta      = result.metadata
+                fvg_mid   = _safe_float(meta.get("fvg_mid"))
+                fvg_low   = _safe_float(meta.get("fvg_low"))
+                fvg_high  = _safe_float(meta.get("fvg_high"))
+                expire_at = meta.get("expire_at")
+
+                if fvg_mid is None or fvg_high is None:
+                    logger.debug("[BacktestEngine] T2 short skipped: no fvg_mid in metadata")
+                else:
+                    sl_price = fvg_high + (T2_BUFFER_PIPS * self.PIP_SIZE)
+                    lot      = self._size_lot(fvg_mid, sl_price, current_equity, trade_type="T2")
+                    s2       = TradeState(
+                        type="T2", trade_pair_id=_pair_id - 1,
+                        position=Position.SHORT,
+                        pending=True,
+                        fvg_mid=fvg_mid,
+                        fvg_low=fvg_low,
+                        fvg_high=fvg_high,
+                        expire_at_ms=expire_at or (ts_ms + T2_TIMEOUT_MS),
+                        sl=sl_price,
+                        lot=lot,
+                        bos_direction="bear",
+                    )
+                    s2.entry_reason = result.reason
+                    s2.session      = ctx.session or "asian"
+                    active_trades["T2"] = s2
 
             elif action == Action.CLOSE_T1 and "T1" in active_trades:
-                trade = self._close_trade(active_trades["T1"], bid, ask, ts, "strategy")
+                trade = self._close_trade(active_trades.pop("T1"), bid, ask, ts, "strategy")
                 trades.append(trade)
                 equity_curve.append(equity_curve[-1] + trade.pnl)
-                active_trades.pop("T1", None)
 
             elif action == Action.CLOSE_T2 and "T2" in active_trades:
-                trade = self._close_trade(active_trades["T2"], bid, ask, ts, "strategy")
-                trades.append(trade)
-                equity_curve.append(equity_curve[-1] + trade.pnl)
-                active_trades.pop("T2", None)
+                tstate = active_trades.pop("T2")
+                if not tstate.pending:
+                    trade = self._close_trade(tstate, bid, ask, ts, "strategy")
+                    trades.append(trade)
+                    equity_curve.append(equity_curve[-1] + trade.pnl)
 
             elif action == Action.CLOSE_ALL:
                 for tid in list(active_trades.keys()):
-                    trade = self._close_trade(active_trades[tid], bid, ask, ts, "strategy_all")
+                    tstate = active_trades.pop(tid)
+                    if tstate.pending:
+                        continue
+                    trade = self._close_trade(tstate, bid, ask, ts, "strategy_all")
                     trades.append(trade)
                     equity_curve.append(equity_curve[-1] + trade.pnl)
-                    active_trades.pop(tid, None)
 
-        # ── Close any open position at end of data ────────────────────────
+        # ── End of data — close all remaining active trades ───────────────
         if active_trades and not ticks_df.empty:
-            last  = dict(ticks_df.iloc[-1])
-            for tid, tstate in list(active_trades.items()):
-                trade = self._close_trade(
-                    tstate,
-                    float(last.get("bid", 0.0)),
-                    float(last.get("ask", 0.0)),
-                    pd.Timestamp(last["timestamp_utc"]).to_pydatetime(),
-                    "end_of_data",
-                )
+            last = dict(ticks_df.iloc[-1])
+            last_bid = _safe_float(last.get("bid")) or 0.0
+            last_ask = _safe_float(last.get("ask")) or 0.0
+            last_ts  = pd.Timestamp(last["timestamp_utc"]).to_pydatetime()
+            for tid in list(active_trades.keys()):
+                tstate = active_trades.pop(tid)
+                if tstate.pending:
+                    continue    # pending orders simply expire at end of data
+                trade = self._close_trade(tstate, last_bid, last_ask, last_ts, "end_of_data")
                 trades.append(trade)
                 equity_curve.append(equity_curve[-1] + trade.pnl)
-            active_trades.clear()
 
         return self._compile_results(trades, len(ticks_df), equity_curve, gate_funnel)
 
-    # ── Trade helpers ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Trade helpers
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _open_trade(
         self,
@@ -472,42 +682,206 @@ class BacktestEngine:
         price:     float,
         ts:        datetime,
         spread:    float,
-        atr:       Optional[float] = None,
-        bar_high:  float = 0.0,
-        bar_low:   float = 0.0,
+        sl_price:  float,
+        atr_15m:   float,
+        bar_high:  float,
+        bar_low:   float,
+        lot:       float,
     ) -> None:
-        state.position    = direction
-        state.entry_price = price
-        state.entry_time  = ts
-        state.entry_spread = spread
-        state.peak_price  = price
+        """
+        Initialise a trade that is already filled (T1, or T2 after limit hit).
+        SL must be pre-calculated by the caller (structural, not ATR-generic).
+        """
+        state.position          = direction
+        state.entry_price       = price
+        state.entry_time        = ts
+        state.entry_spread      = spread
+        state.peak_price        = price
+        state.pending           = False
+        state.sl                = sl_price
+        state.lot               = lot
+        state.risk_distance     = abs(price - sl_price)
+        state.entry_candle_high = bar_high
+        state.entry_candle_low  = bar_low
 
-        # ATR-based stop sizing
-        if atr and atr > 0:
-            stop_distance = atr * self.atr_stop_multiplier
-        else:
-            stop_distance = self.trailing_stop_pips * self.PIP_SIZE
-
+        # Point 1 — structural breakeven trigger
         if direction == Position.LONG:
-            state.trailing_stop = price - stop_distance
-            # Point 1: max(entry_candle_high, entry + atr15_15m * 0.3)
-            state.point1_price = max(bar_high, price + (atr * 0.3 if atr else 0.0))
-            # Point 2: Trailing Activation level
-            state.point2_price = price + (stop_distance * 1.5)
+            state.point1_price = max(bar_high, price + atr_15m * P1_ATR_FACTOR)
         else:
-            state.trailing_stop = price + stop_distance
-            # Point 1: min(entry_candle_low, entry - atr15_15m * 0.3)
-            state.point1_price = min(bar_low, price - (atr * 0.3 if atr else 0.0))
-            # Point 2: Trailing Activation level
-            state.point2_price = price - (stop_distance * 1.5)
-            
-        state.sl_pips = stop_distance / self.PIP_SIZE
+            state.point1_price = min(bar_low,  price - atr_15m * P1_ATR_FACTOR)
+
+        # Point 2 — trail activation; must be at least P2_P1_MIN_GAP × ATR beyond Point 1
+        if direction == Position.LONG:
+            raw_p2 = price + atr_15m * P2_ATR_FACTOR
+            min_p2 = state.point1_price + atr_15m * P2_P1_MIN_GAP
+            state.point2_price = max(raw_p2, min_p2)
+        else:
+            raw_p2 = price - atr_15m * P2_ATR_FACTOR
+            min_p2 = state.point1_price - atr_15m * P2_P1_MIN_GAP
+            state.point2_price = min(raw_p2, min_p2)
+
+        state.sl_pips = state.risk_distance / self.PIP_SIZE
 
         logger.debug(
-            f"[BacktestEngine] Opened {direction.value} @ {price:.5f} | "
-            f"TS={state.trailing_stop:.5f} | "
-            f"stop_dist={stop_distance:.5f} ({'ATR' if atr else 'pips'})"
+            f"[BacktestEngine] Opened {state.type} {direction.value} @ {price:.5f} "
+            f"SL={sl_price:.5f} P1={state.point1_price:.5f} P2={state.point2_price:.5f} "
+            f"lot={lot:.4f}"
         )
+
+    def _activate_pending_t2(
+        self,
+        state:          TradeState,
+        fill_price:     float,
+        ts:             datetime,
+        spread:         float,
+        row_dict:       dict,
+        current_equity: float,
+    ) -> None:
+        """
+        Transition a pending T2 limit order to active after price hit fvg_mid.
+        Recalculates Point 1 / Point 2 from the actual fill price.
+        Sets optional structural TP if R:R qualifies.
+        """
+        atr_15m   = _safe_float(row_dict.get("atr_15_15m"))
+        bar_high  = _safe_float(row_dict.get("bar_high")) or fill_price
+        bar_low   = _safe_float(row_dict.get("bar_low"))  or fill_price
+
+        if atr_15m is None or atr_15m <= 0:
+            logger.warning("[BacktestEngine] T2 fill: atr_15_15m missing")
+            atr_15m = state.risk_distance   # fallback — risk_distance was set at pending creation
+
+        self._open_trade(
+            state, state.position, fill_price, ts, spread,
+            state.sl, atr_15m, bar_high, bar_low, state.lot,
+        )
+
+        # Optional structural TP at nearest Tier 1/2 level with qualifying R:R
+        tp = self._find_structural_tp(state, row_dict)
+        state.tp = tp
+        if tp is not None:
+            logger.debug(f"[BacktestEngine] T2 structural TP set @ {tp:.5f}")
+
+    def _calc_t1_sl(self, row_dict: dict, direction: Position) -> Optional[float]:
+        """
+        T1 SL = lowest/highest wick extreme in the sweep zone + T1_BUFFER_PIPS.
+        The feature engineer must provide sweep_candle_low / sweep_candle_high
+        as the pre-computed extreme across all 15m candles in the sweep zone.
+        Falls back to None if not available (trade is skipped).
+        """
+        buf = T1_BUFFER_PIPS * self.PIP_SIZE
+        if direction == Position.LONG:
+            extreme = _safe_float(row_dict.get("sweep_candle_low"))
+            if extreme is None:
+                return None
+            return extreme - buf
+        else:
+            extreme = _safe_float(row_dict.get("sweep_candle_high"))
+            if extreme is None:
+                return None
+            return extreme + buf
+
+    def _find_structural_tp(
+        self, state: TradeState, row_dict: dict
+    ) -> Optional[float]:
+        """
+        T2 optional TP at nearest Tier 1/2 liquidity level in trade direction,
+        only if R:R ≥ MIN_TP_RR.
+        Tier 1/2 levels available in row: prev_day_high, prev_day_low,
+        current_session_high, current_session_low, prev_session_high, prev_session_low.
+        """
+        entry = state.entry_price
+        sl    = state.sl
+        if entry is None or sl is None:
+            return None
+
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+
+        # Collect all Tier 1/2 levels
+        level_keys = [
+            "prev_day_high", "prev_day_low",
+            "current_session_high", "current_session_low",
+            "prev_session_high",    "prev_session_low",
+        ]
+        candidates: List[float] = []
+        for key in level_keys:
+            val = _safe_float(row_dict.get(key))
+            if val is None:
+                continue
+            if state.position == Position.LONG and val > entry:
+                candidates.append(val)
+            elif state.position == Position.SHORT and val < entry:
+                candidates.append(val)
+
+        if not candidates:
+            return None
+
+        nearest = min(candidates, key=lambda p: abs(p - entry))
+        reward  = abs(nearest - entry)
+
+        if reward >= risk * MIN_TP_RR:
+            return nearest
+        return None
+
+    def _size_lot(
+        self,
+        entry:          float,
+        sl:             float,
+        equity:         float,
+        trade_type:     str = "T1",
+    ) -> float:
+        """
+        Lot sizing to respect the 1% combined max loss rule.
+        For T1: allocate up to 0.5% risk (half of 1% budget for the pair).
+        For T2: allocate the remaining 0.5%.
+        Dollar risk = equity × risk_fraction.
+        Lot = dollar_risk / (risk_pips × pip_value_per_lot).
+
+        These fractions can be tuned — the key constraint is T1+T2 ≤ 1%.
+        """
+        risk_fraction = MAX_ACCOUNT_RISK / 2.0   # 0.5% per leg
+        dollar_risk   = equity * risk_fraction
+        risk_pips     = abs(entry - sl) / self.PIP_SIZE
+        if risk_pips <= 0:
+            return 0.01   # minimum fallback
+        lot = dollar_risk / (risk_pips * self.LOT_PIP_VALUE)
+        # Round to 2 decimal places (standard lot increment for retail brokers)
+        lot = max(0.01, round(lot, 2))
+        return lot
+
+    def _update_fractal_trail(self, state: TradeState, row_dict: dict) -> None:
+        """
+        Fractal trailing SL — updates SL to confirmed 1m swing extremes.
+        One-way only: SL can only move in the direction of the trade, never widen.
+
+        The feature engineer must provide:
+          confirmed_1m_swing_low  — most recent confirmed 1m swing low price
+          confirmed_1m_swing_high — most recent confirmed 1m swing high price
+
+        These must be confirmed (L=R=3 lag satisfied) — NOT the live forming bar.
+        """
+        buf = TRAIL_BUFFER_PIPS * self.PIP_SIZE
+
+        if state.position == Position.LONG:
+            swing_low = _safe_float(row_dict.get("confirmed_1m_swing_low"))
+            if swing_low is not None:
+                candidate = swing_low - buf
+                if candidate > state.sl:          # one-way only — never widen
+                    state.sl = candidate
+                    logger.debug(
+                        f"[BacktestEngine] T{state.type} trail SL raised to {state.sl:.5f}"
+                    )
+
+        elif state.position == Position.SHORT:
+            swing_high = _safe_float(row_dict.get("confirmed_1m_swing_high"))
+            if swing_high is not None:
+                candidate = swing_high + buf
+                if candidate < state.sl:          # one-way only — never widen
+                    state.sl = candidate
+                    logger.debug(
+                        f"[BacktestEngine] T{state.type} trail SL lowered to {state.sl:.5f}"
+                    )
 
     def _close_trade(
         self,
@@ -517,16 +891,16 @@ class BacktestEngine:
         ts:     datetime,
         reason: str,
     ) -> CompletedTrade:
-        # Long exits at bid (sell), short exits at ask (buy back)
         exit_price = bid if state.position == Position.LONG else ask
-        pnl_raw = (
+        pnl_raw    = (
             exit_price - state.entry_price
             if state.position == Position.LONG
             else state.entry_price - exit_price
         )
-        pnl_pips = pnl_raw / self.PIP_SIZE
-        
-        hold_time = (ts - state.entry_time).total_seconds() / 60.0
+        pnl_pips   = pnl_raw / self.PIP_SIZE
+        # Dollar PnL = price movement × lot size × pip value per lot / pip size
+        pnl_dollar = pnl_pips * state.lot * self.LOT_PIP_VALUE
+        hold_time  = (ts - state.entry_time).total_seconds() / 60.0
 
         return CompletedTrade(
             symbol           = self.symbol,
@@ -537,110 +911,147 @@ class BacktestEngine:
             exit_time        = ts,
             entry_price      = state.entry_price,
             exit_price       = exit_price,
-            pnl              = pnl_raw,
+            pnl              = pnl_dollar,
             pnl_pips         = pnl_pips,
+            pnl_raw          = pnl_raw,
+            lot              = state.lot,
             exit_reason      = reason,
             entry_reason     = state.entry_reason,
             session          = state.session,
-            point1_reached   = state.point1_reached,
-            point2_reached   = state.point2_reached,
+            point1_hit       = state.point1_hit,
+            point2_hit       = state.point2_hit,
             hold_time_m      = hold_time,
             sl_pips_at_entry = state.sl_pips,
         )
 
-    def _update_trailing_stop(
-        self, state: TradeState, bid: float, ask: float
-    ) -> None:
-        """Ratchet trailing stop as price moves in our favour."""
-        stop_distance = abs(state.entry_price - state.trailing_stop)
-        if state.position == Position.LONG:
-            if bid > state.peak_price:
-                state.peak_price    = bid
-                state.trailing_stop = max(state.trailing_stop, bid - stop_distance)
-        elif state.position == Position.SHORT:
-            if ask < state.peak_price:
-                state.peak_price    = ask
-                state.trailing_stop = min(state.trailing_stop, ask + stop_distance)
-
-    def _check_trailing_stop(
-        self, state: TradeState, bid: float, ask: float
-    ) -> bool:
-        if state.position == Position.LONG  and bid <= state.trailing_stop:
-            return True
-        if state.position == Position.SHORT and ask >= state.trailing_stop:
-            return True
-        return False
-
     def _is_wide_spread(self, spread: float) -> bool:
-        """
-        Detect abnormally wide spreads that indicate thin liquidity or
-        a data gap — force-close to avoid unrealistic fills.
-        Previously named _check_liquidity_gap (misnomer — this is spread risk,
-        not an FVG / price imbalance gap).
-        """
-        return spread >= self.wide_spread_pips * self.PIP_SIZE
+        return spread >= self.WIDE_SPREAD_PIPS * self.PIP_SIZE
 
     def _unrealised_pnl(self, state: TradeState, mid: float) -> float:
         if state.position == Position.FLAT or state.entry_price is None:
             return 0.0
         if state.position == Position.LONG:
-            return mid - state.entry_price
-        return state.entry_price - mid
+            return (mid - state.entry_price) * state.lot * self.LOT_PIP_VALUE / self.PIP_SIZE
+        return (state.entry_price - mid) * state.lot * self.LOT_PIP_VALUE / self.PIP_SIZE
 
-    # ── Results ───────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Results
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _compile_results(self, trades: list[CompletedTrade], total_ticks: int, equity: list[float], gate_funnel: dict = None) -> BacktestResult:
-        """Hydrate BacktestResult with categorical metrics."""
+    def _compile_results(
+        self,
+        trades:      List[CompletedTrade],
+        total_ticks: int,
+        equity:      List[float],
+        gate_funnel: Dict[str, int],
+    ) -> BacktestResult:
         if not trades:
-            return BacktestResult(total_ticks, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gate_funnel=gate_funnel or {})
+            return BacktestResult(
+                total_ticks, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                gate_funnel=gate_funnel,
+            )
 
-        wins = [t for t in trades if t.pnl > 0]
-        losses = [t for t in trades if t.pnl <= 0]
-        gross_pnl = sum(t.pnl for t in trades)
-        
-        # Categorical Stats
+        wins       = [t for t in trades if t.pnl > 0]
+        losses     = [t for t in trades if t.pnl <= 0]
+        gross_pnl  = sum(t.pnl for t in trades)
+        win_gross  = sum(t.pnl for t in wins)
+        loss_gross = sum(t.pnl for t in losses)
+
         t1_trades = [t for t in trades if t.type == "T1"]
         t2_trades = [t for t in trades if t.type == "T2"]
-        
-        session_stats = {}
-        for sess in ["asian", "london", "newyork"]:
+
+        session_stats: Dict[str, dict] = {}
+        for sess in ("asian", "london", "newyork"):
             s_trades = [t for t in trades if t.session == sess]
             session_stats[sess] = {
                 "total": len(s_trades),
-                "wins": len([t for t in s_trades if t.pnl > 0])
+                "wins":  len([t for t in s_trades if t.pnl > 0]),
             }
 
-        # Simplified metrics
         wr = len(wins) / len(trades)
-        pf = sum(t.pnl for t in wins) / abs(sum(t.pnl for t in losses)) if losses and sum(t.pnl for t in losses) != 0 else 1.0
-        
+        pf = (win_gross / abs(loss_gross)) if loss_gross < 0 else float("inf")
+
+        max_dd   = self._calc_max_drawdown(equity)
+        sharpe   = self._calc_sharpe(trades)
+
         return BacktestResult(
-            total_ticks=total_ticks,
-            total_trades=len(trades),
-            winning_trades=len(wins),
-            losing_trades=len(losses),
-            gross_pnl=gross_pnl,
-            win_rate=wr,
-            avg_pnl_per_trade=gross_pnl / len(trades),
-            max_drawdown=0.0, # Implement if needed
-            profit_factor=pf,
-            sharpe_ratio=0.0, # Implement if needed
-            trades=trades,
-            t1_wins=len([t for t in t1_trades if t.pnl > 0]),
-            t1_losses=len([t for t in t1_trades if t.pnl <= 0]),
-            t2_wins=len([t for t in t2_trades if t.pnl > 0]),
-            t2_losses=len([t for t in t2_trades if t.pnl <= 0]),
-            session_stats=session_stats,
-            gate_funnel=gate_funnel or {}
+            total_ticks       = total_ticks,
+            total_trades      = len(trades),
+            winning_trades    = len(wins),
+            losing_trades     = len(losses),
+            gross_pnl         = gross_pnl,
+            win_rate          = wr,
+            avg_pnl_per_trade = gross_pnl / len(trades),
+            max_drawdown      = max_dd,
+            profit_factor     = pf,
+            sharpe_ratio      = sharpe,
+            trades            = trades,
+            t1_wins           = len([t for t in t1_trades if t.pnl > 0]),
+            t1_losses         = len([t for t in t1_trades if t.pnl <= 0]),
+            t2_wins           = len([t for t in t2_trades if t.pnl > 0]),
+            t2_losses         = len([t for t in t2_trades if t.pnl <= 0]),
+            session_stats     = session_stats,
+            gate_funnel       = gate_funnel,
         )
 
+    @staticmethod
+    def _calc_max_drawdown(equity: List[float]) -> float:
+        """
+        Maximum peak-to-trough drawdown in dollar terms from the equity curve.
+        """
+        if len(equity) < 2:
+            return 0.0
+        arr     = np.array(equity, dtype=float)
+        peak    = np.maximum.accumulate(arr)
+        dd      = peak - arr
+        return float(np.max(dd))
 
-# ── Utility ───────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _calc_sharpe(trades: List[CompletedTrade], risk_free: float = 0.0) -> float:
+        """
+        Annualised Sharpe ratio from per-trade PnL returns.
+        Uses trade count as the time unit (trade-based Sharpe).
+        """
+        if len(trades) < 2:
+            return 0.0
+        returns = np.array([t.pnl for t in trades], dtype=float)
+        mean    = np.mean(returns) - risk_free
+        std     = np.std(returns, ddof=1)
+        if std == 0:
+            return 0.0
+        # Annualise assuming ~252 trades per year as a convention
+        return float((mean / std) * math.sqrt(252))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_float(val) -> Optional[float]:
     try:
-        import math
         f = float(val)
         return None if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_bool(val) -> bool:
+    if val is None:
+        return False
+    try:
+        if pd.isna(val):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, str):
+        return val.lower() in ("true", "1", "yes")
+    return bool(val)
+
+
+def _safe_int(val) -> Optional[int]:
+    try:
+        if val is None:
+            return None
+        return int(float(val))
     except (TypeError, ValueError):
         return None
