@@ -527,7 +527,7 @@ class BacktestEngine:
             bar_low  = _safe_float(row_dict.get("bar_low"))  or mid
             atr_15m  = _safe_float(row_dict.get("atr_15_15m"))
             if atr_15m is None or atr_15m <= 0:
-                logger.warning("[BacktestEngine] atr_15_15m missing — skipping tick for SL calc")
+                logger.debug("[BacktestEngine] atr_15_15m missing — skipping tick for SL calc")
                 atr_15m = None
 
             # ── Execute action ────────────────────────────────────────────

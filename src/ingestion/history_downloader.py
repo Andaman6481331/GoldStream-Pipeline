@@ -189,7 +189,7 @@ class HistoryDownloader:
             / f"year={year}"
             / f"month={month:02d}"
         )
-        hour_files = sorted(partition_dir.glob("[0-9][0-9].parquet"))
+        hour_files = sorted(partition_dir.glob("[0-9][0-9]_[0-9][0-9].parquet"))
         if not hour_files:
             logger.warning(f"[HistoryDownloader] merge_month: no hour files in {partition_dir}")
             return None
@@ -354,13 +354,16 @@ class HistoryDownloader:
         """
         Return the canonical per-hour Parquet path.
         FIX [HIGH]: month directory is zero-padded for consistent sorting.
+        FIX [CRITICAL]: filename includes day to prevent collision — e.g. Jan 1st
+        hour 10 and Jan 2nd hour 10 previously both wrote to '10.parquet',
+        silently overwriting earlier days. Now uses DD_HH.parquet format.
         """
         return (
             self.output_dir
             / self.symbol
             / f"year={hour_dt.year}"
             / f"month={hour_dt.month:02d}"   # zero-padded
-            / f"{hour_dt.hour:02d}.parquet"
+            / f"{hour_dt.day:02d}_{hour_dt.hour:02d}.parquet"  # e.g. 01_10.parquet
         )
 
     def _save_hour_parquet(self, df: pd.DataFrame, hour_dt: datetime) -> Path:

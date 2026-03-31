@@ -139,7 +139,7 @@ class ScoutSniperContext:
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAX_SPREAD_ATR_RATIO   = 0.25   # skip if spread > 25% of atr_15_15m
-MAX_FVG_AGE_BARS       = 20     # discard FVGs older than N closed 1m bars
+MAX_FVG_AGE_BARS       = 10     # discard FVGs older than N closed 1m bars
 
 # Gate 1
 DISPLACEMENT_FACTOR    = 0.5    # impulse body must be ≥ atr20_1m × this
@@ -187,34 +187,44 @@ def make_decision(ctx: ScoutSniperContext) -> DecisionSummary:
     """
 
     # ── Gate: spread filter ───────────────────────────────────────────────
-    atr_15m = ctx.atr_15_15m or 0.0
-    if atr_15m > 0 and ctx.spread > atr_15m * MAX_SPREAD_ATR_RATIO:
-        return DecisionSummary(Action.HOLD, "REASON_SPREAD")
+    # atr_15m = ctx.atr_15_15m or 0.0
+    # if atr_15m > 0 and ctx.spread > atr_15m * MAX_SPREAD_ATR_RATIO:
+    #     return DecisionSummary(Action.HOLD, "REASON_SPREAD")
 
     # ── Gate: 4H bias must not be neutral ─────────────────────────────────
-    if not ctx.market_bias_4h or ctx.market_bias_4h == "neutral":
-        return DecisionSummary(Action.HOLD, "REASON_BIAS")
+    # if not ctx.market_bias_4h or ctx.market_bias_4h == "neutral":
+    #     return DecisionSummary(Action.HOLD, "REASON_BIAS")
 
     # ─────────────────────────────────────────────────────────────────────
     # TRADE 1 — SCOUT (Structural Break)
     # Fires immediately as a market order on BOS/CHoCH confirmation.
     # Direction must align with 4H market_bias. Counter-trend ignored.
     # ─────────────────────────────────────────────────────────────────────
+
     if not ctx.t1_active and not ctx.t2_active:
+        if ctx.bos_detected_15m or ctx.choch_detected_15m:
+            signal_reason = "BOS" if ctx.bos_detected_15m else "CHoCH"
 
-        # Long scout — bullish bias + bullish structure signal
-        if ctx.market_bias_4h == "bullish":
-            if ctx.bos_detected_15m:
-                return DecisionSummary(Action.OPEN_T1_LONG, "BOS")
-            if ctx.choch_detected_15m:
-                return DecisionSummary(Action.OPEN_T1_LONG, "CHoCH")
+            if ctx.bos_direction == "bull":
+                return DecisionSummary(Action.OPEN_T1_LONG, signal_reason)
 
-        # Short scout — bearish bias + bearish structure signal
-        if ctx.market_bias_4h == "bearish":
-            if ctx.bos_detected_15m:
-                return DecisionSummary(Action.OPEN_T1_SHORT, "BOS")
-            if ctx.choch_detected_15m:
-                return DecisionSummary(Action.OPEN_T1_SHORT, "CHoCH")
+            if ctx.bos_direction == "bear":
+                return DecisionSummary(Action.OPEN_T1_SHORT, signal_reason)
+    # if not ctx.t1_active and not ctx.t2_active:
+
+    #     # Long scout — bullish bias + bullish structure signal
+    #     if ctx.market_bias_4h == "bullish":
+    #         if ctx.bos_detected_15m:
+    #             return DecisionSummary(Action.OPEN_T1_LONG, "BOS")
+    #         if ctx.choch_detected_15m:
+    #             return DecisionSummary(Action.OPEN_T1_LONG, "CHoCH")
+
+    #     # Short scout — bearish bias + bearish structure signal
+    #     if ctx.market_bias_4h == "bearish":
+    #         if ctx.bos_detected_15m:
+    #             return DecisionSummary(Action.OPEN_T1_SHORT, "BOS")
+    #         if ctx.choch_detected_15m:
+    #             return DecisionSummary(Action.OPEN_T1_SHORT, "CHoCH")
 
     # ─────────────────────────────────────────────────────────────────────
     # TRADE 2 — SNIPER (Limit order at FVG midpoint)

@@ -148,7 +148,6 @@ class DuckDBStore:
                 bid             DOUBLE,
                 ask             DOUBLE,
                 session         VARCHAR,
-                price_position  VARCHAR,
                 fvg_high        DOUBLE,
                 fvg_low         DOUBLE,
                 fvg_side        VARCHAR,
@@ -432,7 +431,7 @@ class DuckDBStore:
         """Persist a single trade decision into the trade_decisions table."""
         cols = [
             "symbol", "tick_time", "decision", "reason", "score",
-            "mid", "bid", "ask", "session", "rsi_14", "price_position",
+            "mid", "bid", "ask", "session",
             "fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars", "fvg_timestamp",
             "atr_20_1m", "atr_15_15m",
             "prev_day_high", "prev_day_low",

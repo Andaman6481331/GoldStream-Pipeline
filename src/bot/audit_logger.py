@@ -109,11 +109,7 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                     _t1_active = False
                     _t2_active = False
                 
-                # Skip HOLDs
-                if action == Action.HOLD:
-                    skipped += 1
-                    continue
-
+                # Save all decisions (including HOLDs) for multi-tool auditing
                 decision_str = action.value
 
                 # Prepare decision record
@@ -127,8 +123,6 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                     "bid": ctx.bid,
                     "ask": ctx.ask,
                     "session": ctx.session,
-                    "rsi_14": ctx.rsi_14,
-                    "price_position": ctx.price_position,
                     "fvg_high": ctx.fvg_high,
                     "fvg_low": ctx.fvg_low,
                     "fvg_side": ctx.fvg_side,
@@ -164,9 +158,9 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
 
                 logger.info(
                     f"🎯 {decision_str:10s} | "
+                    f"Reason={reason:25s} | "
                     f"BID={ctx.bid:.5f} | "
                     f"Trend={ctx.smc_trend_15m} | "
-                    f"FVG Side={ctx.fvg_side} | "
                     f"Session={ctx.session}"
                 )
 
