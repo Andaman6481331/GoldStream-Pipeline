@@ -245,7 +245,9 @@ class FeatureEngineer:
 
         enriched = pd.merge_asof(
             enriched.sort_values("timestamp_utc"),
-            self.candles_1m[["bar_time", "liq_swept", "liq_side", "sweep_tier"]].sort_values("bar_time"),
+            self.candles_1m[["bar_time", "liq_swept", "liq_side", "sweep_tier", 
+                             "sweep_candle_low", "sweep_candle_high", 
+                             "sweep_wick", "sweep_body"]].sort_values("bar_time"),
             left_on="timestamp_utc", right_on="bar_time", direction="backward",
         ).drop(columns="bar_time", errors="ignore")
 
@@ -275,12 +277,15 @@ class FeatureEngineer:
             "smc_trend_15m", "hh_15m", "ll_15m",
             "strong_low_15m", "strong_high_15m",
             "bos_detected_15m", "choch_detected_15m",
+            "bos_up_15m", "bos_down_15m", "choch_up_15m", "choch_down_15m",
+            "is_swing_high_15m", "is_swing_low_15m",
             "bos_time_ms",          # FIX #13: Gate 3 timing
             "r_dynamic_at_bos",     # FIX #13: Gate 3 timing
             "market_bias_4h",
             "fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars",
             "session",
-            "liq_swept", "liq_side", "sweep_tier",   # FIX #5
+            "liq_swept", "liq_side", "sweep_tier",
+            "sweep_candle_low", "sweep_candle_high", "sweep_wick", "sweep_body",
             "rsi_14",
         ]
         available = [c for c in cols if c in df.columns]
@@ -879,6 +884,7 @@ class FeatureEngineer:
         n      = len(candles_1m)
         lows   = candles_1m["bar_low"].values
         highs  = candles_1m["bar_high"].values
+        opens  = candles_1m["bar_open"].values
         closes = candles_1m["bar_close"].values
         times  = pd.to_datetime(candles_1m["bar_time"].values, utc=True)
         atrs   = (
@@ -890,6 +896,10 @@ class FeatureEngineer:
         liq_swept  = np.zeros(n, dtype=bool)
         liq_side   = np.full(n, None, dtype=object)
         sweep_tier = np.full(n, None, dtype=object)
+        sweep_low  = np.full(n, np.nan, dtype=float)
+        sweep_high = np.full(n, np.nan, dtype=float)
+        sweep_wick = np.full(n, np.nan, dtype=float)
+        sweep_body = np.full(n, np.nan, dtype=float)
 
         # ── Build a time-indexed level history ────────────────────────────────
         # Review FIX #5: levels are built from the full session_levels_df but
@@ -996,6 +1006,10 @@ class FeatureEngineer:
                         liq_swept[i]  = True
                         liq_side[i]   = "high"
                         sweep_tier[i] = level.tier
+                        sweep_high[i] = highs[i]
+                        sweep_low[i]  = lows[i]
+                        sweep_wick[i] = highs[i] - max(opens[i], closes[i])
+                        sweep_body[i] = abs(opens[i] - closes[i])
                         break
 
                 else:  # "low"
@@ -1003,12 +1017,20 @@ class FeatureEngineer:
                         liq_swept[i]  = True
                         liq_side[i]   = "low"
                         sweep_tier[i] = level.tier
+                        sweep_low[i]  = lows[i]
+                        sweep_high[i] = highs[i]
+                        sweep_wick[i] = min(opens[i], closes[i]) - lows[i]
+                        sweep_body[i] = abs(opens[i] - closes[i])
                         break
 
         res = candles_1m.copy()
         res["liq_swept"]  = liq_swept
         res["liq_side"]   = liq_side
         res["sweep_tier"] = sweep_tier
+        res["sweep_candle_low"]  = sweep_low
+        res["sweep_candle_high"] = sweep_high
+        res["sweep_wick"] = sweep_wick
+        res["sweep_body"] = sweep_body
         return res
 
     # ── EQH/EQL helpers  (FIX #15) ───────────────────────────────────────────

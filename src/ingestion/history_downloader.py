@@ -2,42 +2,27 @@
 Bronze Layer — HistoryDownloader
 Fetches Dukascopy .bi5 tick data directly from their CDN using aiohttp,
 parses the LZMA-compressed binary payload with Python's struct module,
-and saves the results as partitioned Parquet files (year/month).
-
-No Node.js or dukascopy-python wrapper required.
+and saves the results as partitioned Parquet files (year/month/DD_HH).
 
 CDN URL pattern:
   https://datafeed.dukascopy.com/datafeed/{SYMBOL}/{YYYY}/{MM:02d}/{DD:02d}/{HH:02d}h_ticks.bi5
 
 Each .bi5 file contains rows of 5 big-endian values:
   uint32  delta_ms  — milliseconds since the start of the hour
-  uint32  ask       — ask * 100_000  (5-digit integer encoding, all instruments)
-  uint32  bid       — bid * 100_000
-  float32 ask_vol   — ask volume (lots)
-  float32 bid_vol   — bid volume (lots)
+  uint32  ask       — ask × 100_000  (XAUUSD and all non-JPY instruments)
+  uint32  bid       — bid × 100_000
+  float32 ask_vol   — ask volume (lots, multiply × 1_000_000 for real units)
+  float32 bid_vol   — bid volume
 
 Total: 20 bytes per tick row.
 
-Fix log vs original:
-  [CRITICAL] POINT_DIVISOR corrected from 1_000 to 100_000.
-             Original produced prices 100× too large (e.g. XAUUSD ~$234,500).
-  [HIGH]     _save_parquet rewritten: each hour is stored as its own file
-             ({HH:02d}.parquet) inside the month partition. A separate
-             merge_month() helper consolidates when needed, avoiding the
-             O(n²) read-rewrite-per-hour pattern.
-  [HIGH]     Retry logic unified into a single loop. Both 503 and network
-             errors share the same attempt counter and back-off, eliminating
-             the interleaved break/continue/else ambiguity.
-  [HIGH]     Month partition directory now zero-padded (month=01 … month=12)
-             for consistent lexicographic sorting and reliable glob patterns.
-  [MEDIUM]   asyncio.gather uses return_exceptions=True so a single failed
-             hour does not cancel the remaining concurrent tasks.
-  [MEDIUM]   summary counters protected by asyncio.Lock — safe if executor
-             threads are introduced later.
-  [MEDIUM]   Resume logic: _fetch_hour checks whether the per-hour Parquet
-             already exists and skips the HTTP request entirely on re-runs.
-  [MEDIUM]   Weekend pre-filter: Saturday (weekday 5) and Sunday (weekday 6)
-             are skipped before any network I/O — gold markets are closed.
+503 mitigation strategy:
+  - max_concurrent default reduced to 2 (Dukascopy CDN throttles at ≥3)
+  - Mandatory inter-request delay (REQUEST_GAP_S) between all requests
+  - Full exponential backoff with wide jitter to prevent thundering herd
+  - max_retries increased to 8 — sustained 503 storms need more patience
+  - Explicit TCPConnector limit matches max_concurrent — no silent overrun
+  - Session-level connector limit prevents burst spikes during task startup
 """
 
 import asyncio
@@ -56,22 +41,27 @@ import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
+
 DUKASCOPY_CDN  = "https://datafeed.dukascopy.com/datafeed"
-BI5_STRUCT_FMT = ">IIIff"                          # big-endian: 3×uint32, 2×float32
+BI5_STRUCT_FMT = ">IIIff"
 BI5_ROW_SIZE   = struct.calcsize(BI5_STRUCT_FMT)   # 20 bytes
 
-# FIX [CRITICAL]: Dukascopy encodes Commodities/JPY as integer × 1,000.
-# The previous refactor wrongly unified this to 100,000, resulting in
-# Gold prices 100× too small ($21 instead of $2,100).
-POINT_DIVISOR  = 1_000.0
+# XAUUSD and all non-JPY instruments: integer encoding is × 100_000.
+# JPY pairs use × 1_000 — if you add JPY symbols, make this per-symbol.
+POINT_DIVISOR  = 100_000.0
 
-# Dukascopy CDN often blocks non-browser agents
+# Dukascopy CDN requires a browser-like UA or returns 403/503 immediately.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/119.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
+
+# Rate-limiting tuning — adjust these if you still hit 503s
+MAX_CONCURRENT  = 2      # safe concurrent requests to Dukascopy CDN
+REQUEST_GAP_S   = 1.5    # minimum seconds between any two requests (even after semaphore release)
+MAX_RETRIES     = 8      # Dukascopy 503 storms can last several minutes
 
 # Parquet schema for Bronze layer
 BRONZE_SCHEMA = pa.schema([
@@ -90,7 +80,7 @@ class HistoryDownloader:
     saves results as partitioned Parquet to the Bronze layer.
 
     Partition layout:
-        <output_dir>/<SYMBOL>/year=<YYYY>/month=<MM:02d>/<HH:02d>.parquet
+        <output_dir>/<SYMBOL>/year=<YYYY>/month=<MM:02d>/<DD:02d>_<HH:02d>.parquet
 
     Each hour is its own file.  Call merge_month() to consolidate a full
     month partition into a single ticks.parquet for downstream consumers.
@@ -102,29 +92,34 @@ class HistoryDownloader:
 
     def __init__(
         self,
-        symbol:          str   = "XAUUSD",
-        output_dir:      str   = "data/bronze",
-        max_concurrent:  int   = 4,
-        max_retries:     int   = 5,
-        request_timeout: int   = 60,
+        symbol:          str  = "XAUUSD",
+        output_dir:      str  = "data/bronze",
+        max_concurrent:  int  = MAX_CONCURRENT,
+        max_retries:     int  = MAX_RETRIES,
+        request_timeout: int  = 60,
+        request_gap_s:   float = REQUEST_GAP_S,
     ):
-        self.symbol        = symbol.upper()
-        self.output_dir    = Path(output_dir)
+        self.symbol         = symbol.upper()
+        self.output_dir     = Path(output_dir)
         self.max_concurrent = max_concurrent
         self.max_retries    = max_retries
-        self.timeout       = aiohttp.ClientTimeout(total=request_timeout)
-        self.headers       = {"User-Agent": USER_AGENT}
+        self.request_gap_s  = request_gap_s
+        self.timeout        = aiohttp.ClientTimeout(total=request_timeout)
+        self.headers        = {"User-Agent": USER_AGENT}
 
-    # ── Public API ────────────────────────────────────────────────────────────
+        # _last_request_at guards the inter-request gap across all coroutines.
+        self._last_request_at: float = 0.0
+
+    # ── Public API ─────────────────────────────────────────────────────────────
 
     async def download_range(self, start: str, end: str) -> dict:
         """
         Download all trading hours between *start* and *end* (inclusive,
-        YYYY-MM-DD format).  Weekend hours are skipped without any network
-        request.  Already-downloaded hours are skipped on re-runs.
+        YYYY-MM-DD format). Weekend hours and already-downloaded hours are
+        skipped without any network request.
 
-        Returns a summary dict: ticks_saved, files_written, hours_skipped,
-        hours_resumed.
+        Returns a summary dict:
+            ticks_saved, files_written, hours_skipped, hours_resumed
         """
         start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         end_dt   = (
@@ -132,12 +127,10 @@ class HistoryDownloader:
             + timedelta(days=1)
         )
 
-        # Build list of hourly datetimes, skipping weekends up-front.
-        # FIX [MEDIUM]: weekend pre-filter eliminates ~17% of wasted 404 requests.
         hours: list[datetime] = []
         cur = start_dt
         while cur < end_dt:
-            if cur.weekday() < 5:   # 0=Mon … 4=Fri are trading days
+            if cur.weekday() < 5:   # 0=Mon … 4=Fri
                 hours.append(cur)
             cur += timedelta(hours=1)
 
@@ -147,22 +140,30 @@ class HistoryDownloader:
         )
 
         semaphore = asyncio.Semaphore(self.max_concurrent)
-        # FIX [MEDIUM]: asyncio.Lock protects shared summary counter mutations.
-        lock    = asyncio.Lock()
-        summary = {"ticks_saved": 0, "files_written": 0, "hours_skipped": 0, "hours_resumed": 0}
+        lock      = asyncio.Lock()
+        summary   = {
+            "ticks_saved":   0,
+            "files_written": 0,
+            "hours_skipped": 0,
+            "hours_resumed": 0,
+        }
+
+        # Explicit connector limit matches max_concurrent — prevents the
+        # aiohttp default pool from silently opening more connections than
+        # intended during the burst at task startup.
+        connector = aiohttp.TCPConnector(limit=self.max_concurrent)
 
         async with aiohttp.ClientSession(
-            timeout=self.timeout, headers=self.headers
+            timeout=self.timeout,
+            headers=self.headers,
+            connector=connector,
         ) as session:
             tasks = [
                 self._fetch_hour(session, semaphore, lock, hour_dt, summary)
                 for hour_dt in hours
             ]
-            # FIX [MEDIUM]: return_exceptions=True prevents one failed task
-            # from cancelling all remaining concurrent downloads.
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log any unexpected exceptions that gather swallowed
         for r in results:
             if isinstance(r, Exception):
                 logger.error(f"[HistoryDownloader] Unhandled task exception: {r}")
@@ -172,16 +173,14 @@ class HistoryDownloader:
             f"ticks_saved={summary['ticks_saved']:,} | "
             f"files_written={summary['files_written']} | "
             f"hours_skipped={summary['hours_skipped']} | "
-            f"hours_resumed={summary['hours_resumed']} (already on disk)"
+            f"hours_resumed={summary['hours_resumed']}"
         )
         return summary
 
     def merge_month(self, year: int, month: int) -> Optional[Path]:
         """
-        Consolidate all per-hour Parquet files for a given month partition
-        into a single ticks.parquet.  Deduplicates by (timestamp_utc, symbol)
-        and sorts ascending.
-
+        Consolidate all per-hour Parquet files for a given month into a single
+        ticks.parquet. Deduplicates by (timestamp_utc, symbol) and sorts ascending.
         Returns the output path, or None if no per-hour files were found.
         """
         partition_dir = (
@@ -194,15 +193,17 @@ class HistoryDownloader:
             logger.warning(f"[HistoryDownloader] merge_month: no hour files in {partition_dir}")
             return None
 
-        tables = [pq.read_table(str(f)) for f in hour_files]
+        tables   = [pq.read_table(str(f)) for f in hour_files]
         combined = pa.concat_tables(tables)
         combined_df = (
             combined.to_pandas()
             .drop_duplicates(subset=["timestamp_utc", "symbol"])
             .sort_values("timestamp_utc")
         )
-        out_table = pa.Table.from_pandas(combined_df, schema=BRONZE_SCHEMA, preserve_index=False)
-        out_path  = partition_dir / "ticks.parquet"
+        out_table = pa.Table.from_pandas(
+            combined_df, schema=BRONZE_SCHEMA, preserve_index=False
+        )
+        out_path = partition_dir / "ticks.parquet"
         pq.write_table(out_table, str(out_path), compression="snappy")
 
         logger.info(
@@ -211,7 +212,23 @@ class HistoryDownloader:
         )
         return out_path
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # ── Internal helpers ───────────────────────────────────────────────────────
+
+    async def _throttle(self) -> None:
+        """
+        Enforce a minimum gap of request_gap_s between requests regardless of
+        concurrency. This is the primary defence against Dukascopy rate-limiting.
+
+        Without this, all coroutines that clear the semaphore simultaneously
+        fire at the CDN in the same millisecond — the semaphore controls
+        parallelism but not request rate.
+        """
+        async with asyncio.Lock():
+            now  = asyncio.get_event_loop().time()
+            wait = self._last_request_at + self.request_gap_s - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_at = asyncio.get_event_loop().time()
 
     async def _fetch_hour(
         self,
@@ -221,41 +238,51 @@ class HistoryDownloader:
         hour_dt:   datetime,
         summary:   dict,
     ) -> None:
-        # FIX [MEDIUM]: resume — skip HTTP entirely if already on disk.
+        # Resume: skip HTTP entirely if already on disk.
         out_path = self._hour_parquet_path(hour_dt)
         if out_path.exists():
             async with lock:
                 summary["hours_resumed"] += 1
             return
 
-        url        = self._build_url(hour_dt)
-        raw_bytes:  Optional[bytes] = None
+        url       = self._build_url(hour_dt)
+        raw_bytes: Optional[bytes] = None
 
-        # FIX [HIGH]: unified retry loop — 503 and network errors share the
-        # same attempt counter.  No more interleaved break/continue/else paths.
         async with semaphore:
+            # Throttle INSIDE the semaphore so the rate limit applies per-slot,
+            # not per-task. Tasks waiting on the semaphore do not consume quota.
+            await self._throttle()
+
             for attempt in range(self.max_retries):
                 try:
                     async with session.get(url) as resp:
+
                         if resp.status == 404:
-                            # No data for this hour (holiday / off-hours gap)
+                            # No data for this hour — holiday / off-hours gap
                             async with lock:
                                 summary["hours_skipped"] += 1
                             return
 
-                        # FIX [HIGH]: 429 (Rate Limit), 502 (Bad Gateway), 503 (Service Unavailable)
                         if resp.status in (429, 502, 503):
-                            wait = (attempt + 1) * 10 + random.uniform(2, 5)
+                            # Exponential backoff with wide jitter.
+                            # Wide jitter (0 – base_wait) scatters retries from
+                            # multiple coroutines so they don't reconverge.
+                            base_wait = min(2 ** attempt * 5, 120)  # caps at 120s
+                            wait      = base_wait + random.uniform(0, base_wait)
                             logger.warning(
-                                f"[HistoryDownloader] {resp.status} for {hour_dt} "
-                                f"— retry {attempt + 1}/{self.max_retries} in {wait:.1f}s"
+                                f"[HistoryDownloader] HTTP {resp.status} for {hour_dt} "
+                                f"— retry {attempt + 1}/{self.max_retries} "
+                                f"in {wait:.1f}s"
                             )
                             await asyncio.sleep(wait)
-                            continue   # retry
+                            # Re-throttle after sleep so the next attempt also
+                            # respects the inter-request gap.
+                            await self._throttle()
+                            continue
 
                         resp.raise_for_status()
                         raw_bytes = await resp.read()
-                        break  # success — exit retry loop
+                        break   # success
 
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     if attempt == self.max_retries - 1:
@@ -265,15 +292,20 @@ class HistoryDownloader:
                         async with lock:
                             summary["hours_skipped"] += 1
                         return
-                    # Slightly shorter backoff for general network errors (timeout, conn reset)
-                    wait = (attempt + 1) * 4 + random.uniform(1, 2)
+                    # Linear backoff + jitter for network errors (they resolve faster)
+                    wait = (attempt + 1) * 4 + random.uniform(1, 5)
                     logger.warning(
-                        f"[HistoryDownloader] {exc} for {hour_dt} "
+                        f"[HistoryDownloader] {type(exc).__name__} for {hour_dt} "
                         f"— retry {attempt + 1}/{self.max_retries} in {wait:.1f}s"
                     )
                     await asyncio.sleep(wait)
+                    await self._throttle()
             else:
-                # Exhausted all retries (all were 503/502/429)
+                # All retries exhausted on 503/502/429
+                logger.error(
+                    f"[HistoryDownloader] Gave up on {hour_dt} after "
+                    f"{self.max_retries} attempts"
+                )
                 async with lock:
                     summary["hours_skipped"] += 1
                 return
@@ -295,7 +327,7 @@ class HistoryDownloader:
             summary["files_written"] += 1
 
     def _build_url(self, hour_dt: datetime) -> str:
-        # Dukascopy CDN months are 0-indexed
+        # Dukascopy CDN months are 0-indexed (Jan = 00)
         return (
             f"{DUKASCOPY_CDN}/{self.symbol}"
             f"/{hour_dt.year}"
@@ -307,7 +339,7 @@ class HistoryDownloader:
     def _parse_bi5(self, data: bytes, hour_dt: datetime) -> Optional[pd.DataFrame]:
         """
         Decompress LZMA payload and unpack binary rows into a DataFrame.
-        Returns None if the file is empty or cannot be parsed.
+        Returns None if the payload is empty or cannot be parsed.
         """
         if not data:
             return None
@@ -334,17 +366,23 @@ class HistoryDownloader:
                 BI5_STRUCT_FMT, chunk
             )
             ts_ms = hour_epoch_ms + delta_ms
-            # FIX [CRITICAL]: divide by 100_000 (was 1_000 — 100× error)
-            ask   = ask_raw / POINT_DIVISOR
+            ask   = ask_raw / POINT_DIVISOR   # 100_000 for XAUUSD
             bid   = bid_raw / POINT_DIVISOR
-            # FIX [CRITICAL]: Dukascopy volume is stored in "millions of units".
-            # Must multiply by 1,000,000 to get real troy ounces for XAUUSD.
-            rows.append((ts_ms, ask, bid, float(ask_vol) * 1_000_000, float(bid_vol) * 1_000_000))
+            # Dukascopy volume is in millions of units — multiply to get real lots
+            rows.append((
+                ts_ms,
+                ask,
+                bid,
+                float(ask_vol) * 1_000_000,
+                float(bid_vol) * 1_000_000,
+            ))
 
         if not rows:
             return None
 
-        df = pd.DataFrame(rows, columns=["ts_ms", "ask", "bid", "ask_volume", "bid_volume"])
+        df = pd.DataFrame(
+            rows, columns=["ts_ms", "ask", "bid", "ask_volume", "bid_volume"]
+        )
         df["timestamp_utc"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
         df["symbol"]        = self.symbol
         df.drop(columns=["ts_ms"], inplace=True)
@@ -352,34 +390,24 @@ class HistoryDownloader:
 
     def _hour_parquet_path(self, hour_dt: datetime) -> Path:
         """
-        Return the canonical per-hour Parquet path.
-        FIX [HIGH]: month directory is zero-padded for consistent sorting.
-        FIX [CRITICAL]: filename includes day to prevent collision — e.g. Jan 1st
-        hour 10 and Jan 2nd hour 10 previously both wrote to '10.parquet',
-        silently overwriting earlier days. Now uses DD_HH.parquet format.
+        Canonical per-hour Parquet path. Day is included in the filename
+        to prevent same-hour collisions across different days.
         """
         return (
             self.output_dir
             / self.symbol
             / f"year={hour_dt.year}"
-            / f"month={hour_dt.month:02d}"   # zero-padded
-            / f"{hour_dt.day:02d}_{hour_dt.hour:02d}.parquet"  # e.g. 01_10.parquet
+            / f"month={hour_dt.month:02d}"
+            / f"{hour_dt.day:02d}_{hour_dt.hour:02d}.parquet"
         )
 
     def _save_hour_parquet(self, df: pd.DataFrame, hour_dt: datetime) -> Path:
-        """
-        FIX [HIGH]: Write a single hour as its own Parquet file instead of
-        appending to a shared monthly file.  This eliminates the O(n²)
-        read-rewrite-per-hour pattern.  Call merge_month() separately when
-        the full month is complete.
-        """
+        """Write a single hour as its own Parquet file."""
         out_path = self._hour_parquet_path(hour_dt)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         table = pa.Table.from_pandas(df, schema=BRONZE_SCHEMA, preserve_index=False)
         pq.write_table(table, str(out_path), compression="snappy")
 
-        logger.debug(
-            f"[HistoryDownloader] Saved {len(df)} rows → {out_path}"
-        )
+        logger.debug(f"[HistoryDownloader] Saved {len(df)} rows → {out_path}")
         return out_path

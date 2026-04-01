@@ -3,7 +3,6 @@ import logging
 import pandas as pd
 from dotenv import load_dotenv
 
-from src.ingestion.mt5_client import connect_mt5, fetch_tick
 from src.validation.silver_processor import SilverProcessor
 from src.gold.duckdb_store import DuckDBStore
 from src.gold.feature_engineer import FeatureEngineer
@@ -18,9 +17,6 @@ GOLD_DB_PATH = "data/gold/goldstream.duckdb"
 PROCESS_INTERVAL_TICKS = 25  # Run Silver/Gold layers every N ticks
 
 async def run():
-    if not connect_mt5():
-        logger.error("Failed to connect to MT5. Aborting.")
-        return
 
     logger.info("GoldStream Live Pipeline (Scout & Sniper) running...")
     

@@ -15,19 +15,33 @@ Scout & Sniper framework:
 
 Decision hierarchy:
     1. Spread gate         — skip wide-spread / thin-market ticks
-    2. 4H Bias gate        — no trading while bias is neutral
-    3. T1 SCOUT entry      — BOS or CHoCH confirmed on 15m, aligned with 4H bias
-    4. T2 SNIPER entry     — only when T1 stopped at a real loss (Point 1 NOT yet hit)
+    2. T1 SCOUT entry      — BOS or CHoCH confirmed on 15m, fires freely
+                             direction from bos_up/down_15m, choch_up/down_15m
+                             4H bias NOT checked — scout probes both directions
+    3. T2 SNIPER entry     — only when T1 stopped at a real loss (Point 1 NOT yet hit)
        Gate 1: FVG exists, not refilled, impulse body ≥ atr20_1m × DISPLACEMENT_FACTOR
        Gate 2: FVG size ≥ max(atr20_1m × FVG_ATR_MULTIPLIER, ABSOLUTE_MIN_PIPS)
        Gate 3: 15m structure still intact (time-conditional on r_dynamic at BOS time)
        Gate 4: Liquidity sweep confirmed (tiered levels)
        Scoring: Sweep strength (0–5) + FVG quality (0–5) = 0–10
+       Threshold: with-trend vs 4H bias → 4+  |  counter-trend or neutral → 7+
 
-New DB columns required in tick_features (add to FeatureEngineer):
+T1 direction logic:
+    Direction is determined by the directional signal columns from the feature engineer:
+        bos_up_15m   / choch_up_15m   → LONG  (bull BOS / bull CHoCH)
+        bos_down_15m / choch_down_15m → SHORT (bear BOS / bear CHoCH)
+    These are cross-checked against market_bias_4h — counter-trend signals are ignored.
+    bos_direction (relayed by engine) is only used for T2 Gate 3 — it is NEVER
+    populated at T1 decision time and must NOT be used to determine T1 direction.
+
+DB columns required in tick_features:
     smc_trend_15m           str   — "bull" | "bear" | "neutral"
-    bos_detected_15m        bool  — Break of Structure confirmed this tick
-    choch_detected_15m      bool  — Change of Character confirmed this tick
+    bos_detected_15m        bool  — any BOS confirmed this tick (either direction)
+    choch_detected_15m      bool  — any CHoCH confirmed this tick (either direction)
+    bos_up_15m              bool  — bullish BOS (close above HH)
+    bos_down_15m            bool  — bearish BOS (close below LL)
+    choch_up_15m            bool  — bullish CHoCH (bear→bull flip)
+    choch_down_15m          bool  — bearish CHoCH (bull→bear flip)
     market_bias_4h          str   — "bullish" | "bearish" | "neutral"
     fvg_high                float — top boundary of nearest active FVG
     fvg_low                 float — bottom boundary of nearest active FVG
@@ -38,12 +52,13 @@ New DB columns required in tick_features (add to FeatureEngineer):
     fvg_inside_4h_ob        bool  — True = FVG midpoint sits inside a 4H order block
     liq_swept               bool  — True = a liquidity level was swept
     liq_side                str   — "high" | "low" (which side was swept)
-    liq_tier                int   — 1 | 2 | 3  (tier of swept level — see spec)
-    sweep_wick              float — wick size of sweep candle (in price units)
-    sweep_body              float — body size of sweep candle (in price units)
-    bos_direction           str   — "bull" | "bear" — direction stored at T1 fire time
-    bos_time_ms             int   — unix ms timestamp at BOS/CHoCH confirmation
-    r_dynamic_at_bos        int   — R_dynamic value stored at T1 fire time
+    liq_tier                int   — 1 | 2 | 3  (tier of swept level)
+    sweep_wick              float — wick size of sweep candle (price units)
+    sweep_body              float — body size of sweep candle (price units)
+    -- relayed by engine, NOT from DB row:
+    bos_direction           str   — "bull" | "bear" — stored at T1 fire time, for T2 Gate 3
+    bos_time_ms             int   — unix ms — for T2 Gate 3 timing
+    r_dynamic_at_bos        int   — R_dynamic at T1 fire time — for T2 Gate 3
 """
 
 from __future__ import annotations
@@ -66,6 +81,10 @@ class ScoutSniperContext:
     All fields map to tick_features DB columns or are relayed by the engine.
     """
 
+    # ── Identifiers ───────────────────────────────────────────────────────
+    timestamp_utc: pd.Timestamp
+    symbol:        str
+
     # ── Price ─────────────────────────────────────────────────────────────
     mid:    float
     bid:    float
@@ -73,21 +92,21 @@ class ScoutSniperContext:
     spread: float
 
     # ── Session ───────────────────────────────────────────────────────────
-    session:        Optional[str]   # "london" | "newyork" | "asian" | "off"
-    bar_close:      Optional[float]
+    session:        Optional[str]    = None   # "london" | "newyork" | "asian" | "off"
+    bar_close:      Optional[float]  = None
 
     # ── Fair Value Gap (1m) ───────────────────────────────────────────────
-    fvg_high:              Optional[float] = None
-    fvg_low:               Optional[float] = None
-    fvg_side:              Optional[str]   = None   # "bullish_fvg" | "bearish_fvg"
-    fvg_filled:            bool            = False
-    fvg_age_bars:          Optional[int]   = None   # closed 1m bars since FVG formed
-    fvg_impulse_candle:    bool            = False  # FVG formed on the BOS impulse candle
-    fvg_inside_4h_ob:      bool            = False  # FVG midpoint inside a 4H order block
+    fvg_high:           Optional[float] = None
+    fvg_low:            Optional[float] = None
+    fvg_side:           Optional[str]   = None   # "bullish_fvg" | "bearish_fvg"
+    fvg_filled:         bool            = False
+    fvg_age_bars:       Optional[int]   = None
+    fvg_impulse_candle: bool            = False
+    fvg_inside_4h_ob:   bool            = False
 
     # ── ATR ───────────────────────────────────────────────────────────────
-    atr_20_1m:    Optional[float] = None   # ATR(20) on 1m — Gate 1/2 checks
-    atr_15_15m:   Optional[float] = None   # ATR(15) on 15m — spread filter
+    atr_20_1m:  Optional[float] = None
+    atr_15_15m: Optional[float] = None
 
     # ── Session levels ────────────────────────────────────────────────────
     prev_day_high:        Optional[float] = None
@@ -103,57 +122,63 @@ class ScoutSniperContext:
     n_confirmed_swing_lows_15m:  int = 0
 
     # ── SMC Phase 2 — Structural Nodes & Bias ─────────────────────────────
-    smc_trend_15m:      Optional[str]   = None   # "bull" | "bear" | "neutral"
+    smc_trend_15m:      Optional[str]   = None
     hh_15m:             Optional[float] = None
     ll_15m:             Optional[float] = None
     strong_low_15m:     Optional[float] = None
     strong_high_15m:    Optional[float] = None
-    bos_detected_15m:   bool            = False
-    choch_detected_15m: bool            = False
     market_bias_4h:     Optional[str]   = None   # "bullish" | "bearish" | "neutral"
     fvg_timestamp:      Optional[pd.Timestamp] = None
 
-    # ── Liquidity sweep ───────────────────────────────────────────────────
-    liq_swept:    bool           = False
-    liq_side:     Optional[str]  = None   # "high" | "low"
-    liq_tier:     Optional[int]  = None   # 1 | 2 | 3  — REQUIRED for sweep score
-    sweep_wick:   Optional[float] = None  # wick size of the sweep candle
-    sweep_body:   Optional[float] = None  # body size of the sweep candle
+    # ── Directional signal breakdown (FROM DB ROW — used for T1 direction) ──
+    # These are the correct source of T1 trade direction.
+    bos_detected_15m:   bool = False   # any BOS this tick
+    choch_detected_15m: bool = False   # any CHoCH this tick
+    bos_up_15m:         bool = False   # bullish BOS — triggers T1 LONG
+    bos_down_15m:       bool = False   # bearish BOS — triggers T1 SHORT
+    choch_up_15m:       bool = False   # bullish CHoCH — triggers T1 LONG
+    choch_down_15m:     bool = False   # bearish CHoCH — triggers T1 SHORT
+    is_swing_high_15m:  bool = False
+    is_swing_low_15m:   bool = False
 
-    # ── BOS context — stored at T1 fire time, relayed for T2 ─────────────
-    # These must be populated from the engine's stored state, not the live row.
+    # ── Liquidity sweep ───────────────────────────────────────────────────
+    liq_swept:   bool            = False
+    liq_side:    Optional[str]   = None   # "high" | "low"
+    liq_tier:    Optional[int]   = None   # 1 | 2 | 3
+    sweep_candle_low:  Optional[float] = None
+    sweep_candle_high: Optional[float] = None
+    sweep_wick:        Optional[float] = None
+    sweep_body:        Optional[float] = None
+    rsi_14:            Optional[float] = None
+
+    # ── BOS context — relayed by ENGINE at T1 fire time, for T2 Gate 3 only ──
+    # These are NEVER populated from the DB row at T1 decision time.
+    # They are passed as kwargs by the engine after T1 has already fired.
     bos_direction:    Optional[str] = None   # "bull" | "bear"
-    bos_time_ms:      Optional[int] = None   # unix ms — for Gate 3 timing
-    r_dynamic_at_bos: Optional[int] = None   # R stored at BOS time — Gate 3
+    bos_time_ms:      Optional[int] = None   # unix ms
+    r_dynamic_at_bos: Optional[int] = None   # R stored at BOS time
 
     # ── Trade status (relayed by engine) ──────────────────────────────────
-    t1_active:       bool = False
-    t2_active:       bool = False
-    # True ONLY when T1 was stopped at a real loss — i.e. Point 1 was NEVER hit.
-    # If T1 stopped at breakeven (Point 1 already hit) this must be False.
-    t1_stopped_at_loss: bool = False
+    t1_active:          bool = False
+    t2_active:          bool = False
+    t1_stopped_at_loss: bool = False   # True ONLY if T1 stopped before Point 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Thresholds  (tune during backtesting — all [BACKTEST] per spec)
+# Thresholds  (tune during backtesting)
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_SPREAD_ATR_RATIO   = 0.25   # skip if spread > 25% of atr_15_15m
-MAX_FVG_AGE_BARS       = 10     # discard FVGs older than N closed 1m bars
+MAX_SPREAD_ATR_RATIO = 0.25   # skip if spread > 25% of atr_15_15m
+MAX_FVG_AGE_BARS     = 10     # discard FVGs older than N closed 1m bars
 
-# Gate 1
-DISPLACEMENT_FACTOR    = 0.5    # impulse body must be ≥ atr20_1m × this
-
-# Gate 2
-FVG_ATR_MULTIPLIER     = 0.15   # FVG size floor as fraction of atr20_1m
-ABSOLUTE_MIN_PIPS      = 3.0    # FVG size floor in pips (absolute)
-
-# Scoring
-FVG_WIDTH_SCORE_PIPS   = 15.0   # FVG width > this → +2 on FVG score
-MIN_SNIPER_SCORE       = 4      # minimum total score (0–10 scale) to allow T2
-
-# T2 order timeout
-T2_TIMEOUT_MS          = 10 * 60 * 1000   # 10 minutes in milliseconds
+DISPLACEMENT_FACTOR  = 0.5    # Gate 1: impulse body ≥ atr20_1m × this
+FVG_ATR_MULTIPLIER   = 0.15   # Gate 2: FVG size floor fraction of atr20_1m
+ABSOLUTE_MIN_PIPS    = 3.0    # Gate 2: FVG absolute size floor (pips)
+FVG_WIDTH_SCORE_PIPS = 15.0   # FVG score: width > this → +2
+MIN_SNIPER_SCORE     = 4      # minimum 0–10 total score for T2
+T2_TIMEOUT_MS        = 10 * 60 * 1000   # 10 min
+MIN_SNIPER_SCORE         = 4   # with-trend T2 minimum score
+MIN_SNIPER_SCORE_COUNTER = 7   # counter-trend T2 minimum score (higher bar)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,86 +200,65 @@ def make_decision(ctx: ScoutSniperContext) -> DecisionSummary:
     """
     Core strategy decision logic for Scout & Sniper.
 
-    Flow:
-      1. Spread gate.
-      2. 4H bias gate.
-      3. T1 SCOUT  — fires market order on BOS/CHoCH, aligned with 4H bias.
-      4. T2 SNIPER — fires limit order at FVG midpoint ONLY when:
-           • T1 stopped at a true loss (t1_stopped_at_loss=True, Point 1 not yet hit).
-           • T2 is not already active.
-           • Hard gates 1–4 all pass.
-           • Aggregate score ≥ MIN_SNIPER_SCORE.
+    T1 direction is determined by the directional signal columns:
+        bos_up_15m / choch_up_15m   → LONG
+        bos_down_15m / choch_down_15m → SHORT
+    No 4H bias gate on T1 — scout fires freely in both directions.
+
+    T2 sniper applies bias-aware score threshold:
+        - With-trend (bos_direction aligns with market_bias_4h): MIN_SNIPER_SCORE (4)
+        - Counter-trend (bos_direction opposes market_bias_4h):  MIN_SNIPER_SCORE_COUNTER (7)
+        - Bias neutral: treated as counter-trend (7)
     """
 
     # ── Gate: spread filter ───────────────────────────────────────────────
-    # atr_15m = ctx.atr_15_15m or 0.0
-    # if atr_15m > 0 and ctx.spread > atr_15m * MAX_SPREAD_ATR_RATIO:
-    #     return DecisionSummary(Action.HOLD, "REASON_SPREAD")
-
-    # ── Gate: 4H bias must not be neutral ─────────────────────────────────
-    # if not ctx.market_bias_4h or ctx.market_bias_4h == "neutral":
-    #     return DecisionSummary(Action.HOLD, "REASON_BIAS")
+    atr_15m = ctx.atr_15_15m
+    if atr_15m and atr_15m > 0 and ctx.spread > atr_15m * MAX_SPREAD_ATR_RATIO:
+        if ctx.bos_detected_15m:
+            print(f"DEBUG HOLD Spread Gate: spread={ctx.spread}, atr={atr_15m}, max={atr_15m*MAX_SPREAD_ATR_RATIO}")
+        return DecisionSummary(Action.HOLD, "REASON_SPREAD")
 
     # ─────────────────────────────────────────────────────────────────────
-    # TRADE 1 — SCOUT (Structural Break)
-    # Fires immediately as a market order on BOS/CHoCH confirmation.
-    # Direction must align with 4H market_bias. Counter-trend ignored.
+    # TRADE 1 — SCOUT
+    # Fires freely on any confirmed 15m BOS/CHoCH.
+    # Direction comes from directional signal columns only.
+    # 4H bias is NOT checked here.
     # ─────────────────────────────────────────────────────────────────────
-
     if not ctx.t1_active and not ctx.t2_active:
-        if ctx.bos_detected_15m or ctx.choch_detected_15m:
-            signal_reason = "BOS" if ctx.bos_detected_15m else "CHoCH"
+        if ctx.bos_detected_15m:
+            print(f"DEBUG BOS detected at {ctx.timestamp_utc}: up={ctx.bos_up_15m}, down={ctx.bos_down_15m}, t1_act={ctx.t1_active}, t2_act={ctx.t2_active}")
 
-            if ctx.bos_direction == "bull":
-                return DecisionSummary(Action.OPEN_T1_LONG, signal_reason)
+        if ctx.bos_up_15m or ctx.choch_up_15m:
+            reason = "BOS" if ctx.bos_up_15m else "CHoCH"
+            res = DecisionSummary(Action.OPEN_T1_LONG, reason)
+            if ctx.bos_detected_15m:
+                print(f"DEBUG make_decision returning: {res.action.value} reason={res.reason}")
+            return res
 
-            if ctx.bos_direction == "bear":
-                return DecisionSummary(Action.OPEN_T1_SHORT, signal_reason)
-    # if not ctx.t1_active and not ctx.t2_active:
-
-    #     # Long scout — bullish bias + bullish structure signal
-    #     if ctx.market_bias_4h == "bullish":
-    #         if ctx.bos_detected_15m:
-    #             return DecisionSummary(Action.OPEN_T1_LONG, "BOS")
-    #         if ctx.choch_detected_15m:
-    #             return DecisionSummary(Action.OPEN_T1_LONG, "CHoCH")
-
-    #     # Short scout — bearish bias + bearish structure signal
-    #     if ctx.market_bias_4h == "bearish":
-    #         if ctx.bos_detected_15m:
-    #             return DecisionSummary(Action.OPEN_T1_SHORT, "BOS")
-    #         if ctx.choch_detected_15m:
-    #             return DecisionSummary(Action.OPEN_T1_SHORT, "CHoCH")
+        if ctx.bos_down_15m or ctx.choch_down_15m:
+            reason = "BOS" if ctx.bos_down_15m else "CHoCH"
+            res = DecisionSummary(Action.OPEN_T1_SHORT, reason)
+            if ctx.bos_detected_15m:
+                print(f"DEBUG make_decision returning: {res.action.value} reason={res.reason}")
+            return res
 
     # ─────────────────────────────────────────────────────────────────────
-    # TRADE 2 — SNIPER (Limit order at FVG midpoint)
-    # Only reached if T1 was stopped at a REAL LOSS (before Point 1 / breakeven).
-    # A breakeven stop or a trailing stop does NOT trigger T2.
+    # TRADE 2 — SNIPER
+    # Only when T1 stopped at real loss (before Point 1), T2 not already active.
+    # Score threshold is bias-aware: counter-trend requires 7+, with-trend 4+.
     # ─────────────────────────────────────────────────────────────────────
     if not ctx.t1_active and ctx.t1_stopped_at_loss and not ctx.t2_active:
 
-        # ── Hard Gate 1 — FVG exists, not refilled, real displacement ─────
-        # FVG must be present and still open.
+        # ── Hard Gate 1 — FVG exists, not refilled ────────────────────────
         if not ctx.fvg_side or ctx.fvg_filled:
             return DecisionSummary(Action.HOLD, "REASON_NO_FVG")
 
         if ctx.fvg_high is None or ctx.fvg_low is None:
             return DecisionSummary(Action.HOLD, "REASON_NO_FVG")
 
-        # Displacement check: impulse candle body must be a real move,
-        # not a spread artifact. Body < atr20_1m × DISPLACEMENT_FACTOR → reject.
         atr_1m = ctx.atr_20_1m
         if atr_1m is None or atr_1m <= 0:
             return DecisionSummary(Action.HOLD, "REASON_NO_ATR")
-
-        # fvg_impulse_body must be provided by feature engineer as a column.
-        # If absent we cannot verify displacement — reject conservatively.
-        if not ctx.fvg_impulse_candle:
-            # fvg_impulse_candle=True means the FVG formed on the BOS impulse candle.
-            # We re-use this boolean as a proxy that displacement was validated upstream.
-            # If the feature engineer computes explicit impulse body size, replace this
-            # with: if impulse_body < atr_1m * DISPLACEMENT_FACTOR: abort
-            pass  # displacement confirmed by feature engineer via fvg_impulse_candle flag
 
         # ── Hard Gate 2 — FVG size above noise floor ──────────────────────
         fvg_size = ctx.fvg_high - ctx.fvg_low
@@ -263,42 +267,27 @@ def make_decision(ctx: ScoutSniperContext) -> DecisionSummary:
             return DecisionSummary(Action.HOLD, "REASON_FVG_TOO_SMALL")
 
         # ── Hard Gate 3 — 15m structure still intact (time-conditional) ───
-        # Only checked AFTER the confirmation lag (r_dynamic × 15 min) has elapsed.
-        # Uses r_dynamic stored at BOS time — never the current live R.
-        # If elapsed < lag: skip the check (swing history unchanged, scoring protects).
         if ctx.bos_time_ms is not None and ctx.r_dynamic_at_bos is not None:
-            now_ms            = int(time.time() * 1000)
-            lag_ms            = ctx.r_dynamic_at_bos * 15 * 60 * 1000
-            elapsed_ms        = now_ms - ctx.bos_time_ms
+            now_ms     = int(time.time() * 1000)
+            lag_ms     = ctx.r_dynamic_at_bos * 15 * 60 * 1000
+            elapsed_ms = now_ms - ctx.bos_time_ms
             if elapsed_ms >= lag_ms:
                 if not _is_15m_structure_intact(ctx):
                     return DecisionSummary(Action.HOLD, "REASON_STRUCTURE_BROKEN")
-        # If bos_time_ms / r_dynamic_at_bos not available: skip Gate 3
-        # (scoring provides protection via sweep/FVG quality gates)
 
         # ── Hard Gate 4 — Liquidity sweep confirmed ────────────────────────
         if not ctx.liq_swept:
             return DecisionSummary(Action.HOLD, "REASON_NO_LIQUIDITY")
 
-        # liq_tier must be provided; Tier 3 passes gate with 0 score contribution.
         if ctx.liq_tier is None:
             return DecisionSummary(Action.HOLD, "REASON_NO_LIQ_TIER")
 
-        # ─────────────────────────────────────────────────────────────────
-        # SCORING — Sweep Strength (0–5) + FVG Quality (0–5) = 0–10
-        # ─────────────────────────────────────────────────────────────────
-
-        # --- Sweep Strength Score (max 5) --------------------------------
+        # ── Sweep Strength Score (0–5) ────────────────────────────────────
         sweep_score = 0
-
-        # Tier 1 (+2) and Tier 2 (+1) are mutually exclusive.
-        # Tier 3 passes the gate but contributes 0 points.
         if ctx.liq_tier == 1:
             sweep_score += 2
         elif ctx.liq_tier == 2:
             sweep_score += 1
-
-        # Sweep wick > 50% of candle body → +1
         if (
             ctx.sweep_wick is not None
             and ctx.sweep_body is not None
@@ -306,77 +295,77 @@ def make_decision(ctx: ScoutSniperContext) -> DecisionSummary:
             and ctx.sweep_wick > ctx.sweep_body * 0.5
         ):
             sweep_score += 1
-
-        # Sweep occurred during London or NY session → +1
         if ctx.session in ("london", "newyork"):
             sweep_score += 1
-
-        # Signal is CHoCH (trend flip) → +1
         if ctx.choch_detected_15m:
             sweep_score += 1
-
         sweep_score = min(sweep_score, 5)
 
-        # --- FVG Quality Score (max 5) ------------------------------------
+        # ── FVG Quality Score (0–5) ───────────────────────────────────────
         fvg_score = 0
-
-        # FVG width > FVG_WIDTH_SCORE_PIPS → +2
         if fvg_size > FVG_WIDTH_SCORE_PIPS:
             fvg_score += 2
-
-        # FVG formed on the BOS impulse candle itself → +1
         if ctx.fvg_impulse_candle:
             fvg_score += 1
-
-        # FVG sits inside a 4H order block zone → +1
         if ctx.fvg_inside_4h_ob:
             fvg_score += 1
-
-        # FVG unfilled for > 3 closed 1m candles before entry → +1
         if ctx.fvg_age_bars is not None and ctx.fvg_age_bars > 3:
             fvg_score += 1
-
         fvg_score = min(fvg_score, 5)
 
-        # --- Total score --------------------------------------------------
         total_score = sweep_score + fvg_score   # 0–10
 
-        if total_score < MIN_SNIPER_SCORE:
+        # ── Bias-aware score threshold ────────────────────────────────────
+        # Determine if this T2 is with-trend or counter-trend vs 4H bias.
+        # bos_direction is "bull" (long) or "bear" (short), relayed from engine.
+        bos_dir = ctx.bos_direction
+        bias    = ctx.market_bias_4h   # "bullish" | "bearish" | "neutral" | None
+
+        is_with_trend = (
+            (bos_dir == "bull" and bias == "bullish")
+            or
+            (bos_dir == "bear" and bias == "bearish")
+        )
+        # Neutral bias or missing bias → treated as counter-trend (stricter threshold)
+        required_score = MIN_SNIPER_SCORE if is_with_trend else MIN_SNIPER_SCORE_COUNTER
+
+        if total_score < required_score:
             return DecisionSummary(
                 Action.HOLD,
                 "REASON_SCORE_TOO_LOW",
-                {"total_score": total_score, "sweep_score": sweep_score, "fvg_score": fvg_score},
+                {
+                    "total_score":    total_score,
+                    "sweep_score":    sweep_score,
+                    "fvg_score":      fvg_score,
+                    "required_score": required_score,
+                    "is_with_trend":  is_with_trend,
+                },
             )
 
-        # ── Build limit order metadata (engine needs these to place the order) ──
-        fvg_mid    = (ctx.fvg_low + ctx.fvg_high) / 2.0
-        now_ms     = int(time.time() * 1000)
-        expire_at  = now_ms + T2_TIMEOUT_MS
+        # ── Build limit order metadata ────────────────────────────────────
+        fvg_mid   = (ctx.fvg_low + ctx.fvg_high) / 2.0
+        now_ms    = int(time.time() * 1000)
+        expire_at = now_ms + T2_TIMEOUT_MS
 
         order_meta = {
-            "total_score":  total_score,
-            "sweep_score":  sweep_score,
-            "fvg_score":    fvg_score,
-            "fvg_mid":      fvg_mid,      # limit order price
-            "fvg_low":      ctx.fvg_low,  # SL reference
-            "fvg_high":     ctx.fvg_high, # SL reference
-            "expire_at":    expire_at,    # cancel if not filled by this unix ms
+            "total_score":    total_score,
+            "sweep_score":    sweep_score,
+            "fvg_score":      fvg_score,
+            "required_score": required_score,
+            "is_with_trend":  is_with_trend,
+            "fvg_mid":        fvg_mid,
+            "fvg_low":        ctx.fvg_low,
+            "fvg_high":       ctx.fvg_high,
+            "expire_at":      expire_at,
         }
 
-        # Direction follows bos_direction stored at T1 fire time.
-        # Falls back to liq_side if bos_direction not relayed (should not happen).
-        bos_dir = ctx.bos_direction
-
-        # Bullish sniper — swept a LOW, retracing into bullish FVG
         if (bos_dir == "bull" or ctx.liq_side == "low") and ctx.fvg_side == "bullish_fvg":
             return DecisionSummary(Action.OPEN_T2_LONG, "LIQ_SWEEP", order_meta)
 
-        # Bearish sniper — swept a HIGH, retracing into bearish FVG
         if (bos_dir == "bear" or ctx.liq_side == "high") and ctx.fvg_side == "bearish_fvg":
             return DecisionSummary(Action.OPEN_T2_SHORT, "LIQ_SWEEP", order_meta)
 
     return DecisionSummary(Action.HOLD, "hold")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
@@ -384,10 +373,7 @@ def make_decision(ctx: ScoutSniperContext) -> DecisionSummary:
 
 def _is_15m_structure_intact(ctx: ScoutSniperContext) -> bool:
     """
-    Gate 3 structure check.
-    For a bull signal: HH and strong_low must still exist (structure not broken down).
-    For a bear signal: LL and strong_high must still exist (structure not broken up).
-    Uses bos_direction stored at T1 fire time, not live smc_trend_15m.
+    Gate 3: uses bos_direction relayed from engine (stored at T1 fire time).
     """
     if ctx.bos_direction == "bull":
         return ctx.hh_15m is not None and ctx.strong_low_15m is not None
@@ -403,42 +389,36 @@ def _is_15m_structure_intact(ctx: ScoutSniperContext) -> bool:
 def build_context_from_row(
     row: dict,
     *,
-    t1_stopped_at_loss: bool  = False,   # True only if T1 stopped BEFORE Point 1
-    t1_active:          bool  = False,
-    t2_active:          bool  = False,
-    bos_direction:      Optional[str] = None,   # stored at T1 fire time
-    bos_time_ms:        Optional[int] = None,   # stored at T1 fire time
-    r_dynamic_at_bos:   Optional[int] = None,   # stored at T1 fire time
+    t1_stopped_at_loss: bool         = False,
+    t1_active:          bool         = False,
+    t2_active:          bool         = False,
+    bos_direction:      Optional[str] = None,   # relayed by engine after T1 fires
+    bos_time_ms:        Optional[int] = None,   # relayed by engine after T1 fires
+    r_dynamic_at_bos:   Optional[int] = None,   # relayed by engine after T1 fires
 ) -> ScoutSniperContext:
     """
-    Converts a tick_features DB row (asyncpg Record or plain dict)
-    into a ScoutSniperContext ready for make_decision().
+    Converts a tick_features DB row into a ScoutSniperContext.
 
-    Engine-level trade state (t1_active, t2_active, t1_stopped_at_loss,
-    bos_direction, bos_time_ms, r_dynamic_at_bos) must be passed in as
-    keyword arguments — they are NOT stored in the DB row.
-
-    NOTE on t1_stopped_at_loss:
-        Must be True ONLY when T1 was closed at a real loss, meaning
-        the stop was hit before Point 1 (breakeven) was ever reached.
-        If T1 stopped at breakeven or at a trailing stop profit, pass False.
+    IMPORTANT: bos_direction / bos_time_ms / r_dynamic_at_bos are engine-relay
+    fields. They are None at T1 decision time by design. T1 direction is
+    determined by bos_up_15m / bos_down_15m / choch_up_15m / choch_down_15m
+    which come from the DB row.
     """
     bid = float(row.get("bid", 0.0))
     ask = float(row.get("ask", 0.0))
     mid = (bid + ask) / 2.0
 
     return ScoutSniperContext(
-        # ── Price ─────────────────────────────────────────────────────────
+        timestamp_utc=row.get("timestamp_utc"),
+        symbol=row.get("symbol", "XAUUSD"),
         mid=mid,
         bid=bid,
         ask=ask,
         spread=ask - bid,
 
-        # ── Session ───────────────────────────────────────────────────────
         session=row.get("session"),
         bar_close=_safe_float(row.get("bar_close")),
 
-        # ── FVG ───────────────────────────────────────────────────────────
         fvg_high=_safe_float(row.get("fvg_high")),
         fvg_low=_safe_float(row.get("fvg_low")),
         fvg_side=row.get("fvg_side"),
@@ -447,11 +427,9 @@ def build_context_from_row(
         fvg_impulse_candle=_safe_bool(row.get("fvg_impulse_candle")),
         fvg_inside_4h_ob=_safe_bool(row.get("fvg_inside_4h_ob")),
 
-        # ── ATR ───────────────────────────────────────────────────────────
         atr_20_1m=_safe_float(row.get("atr_20_1m")),
         atr_15_15m=_safe_float(row.get("atr_15_15m")),
 
-        # ── Session levels ────────────────────────────────────────────────
         prev_day_high=_safe_float(row.get("prev_day_high")),
         prev_day_low=_safe_float(row.get("prev_day_low")),
         current_session_high=_safe_float(row.get("current_session_high")),
@@ -462,30 +440,39 @@ def build_context_from_row(
         n_confirmed_swing_highs_15m=_safe_int(row.get("n_confirmed_swing_highs_15m")) or 0,
         n_confirmed_swing_lows_15m=_safe_int(row.get("n_confirmed_swing_lows_15m")) or 0,
 
-        # ── SMC Phase 2 ───────────────────────────────────────────────────
         smc_trend_15m=row.get("smc_trend_15m"),
         hh_15m=_safe_float(row.get("hh_15m")),
         ll_15m=_safe_float(row.get("ll_15m")),
         strong_low_15m=_safe_float(row.get("strong_low_15m")),
         strong_high_15m=_safe_float(row.get("strong_high_15m")),
-        bos_detected_15m=_safe_bool(row.get("bos_detected_15m")),
-        choch_detected_15m=_safe_bool(row.get("choch_detected_15m")),
         market_bias_4h=row.get("market_bias_4h"),
         fvg_timestamp=row.get("fvg_timestamp"),
 
-        # ── Liquidity sweep ───────────────────────────────────────────────
+        # Directional signal columns — source of T1 direction
+        bos_detected_15m=_safe_bool(row.get("bos_detected_15m")),
+        choch_detected_15m=_safe_bool(row.get("choch_detected_15m")),
+        bos_up_15m=_safe_bool(row.get("bos_up_15m")),
+        bos_down_15m=_safe_bool(row.get("bos_down_15m")),
+        choch_up_15m=_safe_bool(row.get("choch_up_15m")),
+        choch_down_15m=_safe_bool(row.get("choch_down_15m")),
+        is_swing_high_15m=_safe_bool(row.get("is_swing_high_15m")),
+        is_swing_low_15m=_safe_bool(row.get("is_swing_low_15m")),
+
         liq_swept=_safe_bool(row.get("liq_swept")),
         liq_side=row.get("liq_side"),
         liq_tier=_safe_int(row.get("liq_tier")),
+        sweep_candle_low=_safe_float(row.get("sweep_candle_low")),
+        sweep_candle_high=_safe_float(row.get("sweep_candle_high")),
         sweep_wick=_safe_float(row.get("sweep_wick")),
         sweep_body=_safe_float(row.get("sweep_body")),
 
-        # ── BOS context — relayed from engine, not from the live row ──────
+        rsi_14=_safe_float(row.get("rsi_14")),
+
+        # Engine-relay fields — None at T1 time, populated by engine for T2
         bos_direction=bos_direction,
         bos_time_ms=bos_time_ms,
         r_dynamic_at_bos=r_dynamic_at_bos,
 
-        # ── Trade status — relayed from engine ────────────────────────────
         t1_active=t1_active,
         t2_active=t2_active,
         t1_stopped_at_loss=t1_stopped_at_loss,

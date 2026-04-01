@@ -34,7 +34,7 @@ pip install -r requirements.txt
 ### 3. Run Historical Ingestion & Strategy Audit
 Download historical data and automatically run the strategy engine over it:
 ```bash
-python ingest_history.py --symbol XAUUSD --start 2024-03-01 --end 2024-03-08
+python ingest_history.py --start 2024-03-01 --end 2024-03-08
 ```
 
 ### 4. Run Live Trading Pipeline
@@ -54,4 +54,4 @@ The system provides a tick-by-tick event-loop engine for full simulation.
 - **Bronze**: Local raw partitioned Parquet (Source-specific).
 - **Silver**: Normalized, validated Pydantic models.
 - **Gold**: DuckDB Feature Store with RSI, ATR, BOS, CHoCH, and FVG detection.
-- **Backtesting**: Tick-by-tick results with spread simulation and trailing stops.
+- **Backtesting**: Tick-by-tick results with spread simulation and trailing stops.

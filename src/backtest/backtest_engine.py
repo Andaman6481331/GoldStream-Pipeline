@@ -41,7 +41,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -65,6 +65,8 @@ TRAIL_BUFFER_PIPS = 2.5   # buffer below/above confirmed 1m swing point for trai
 MIN_TP_RR        = 2.0    # T2 structural TP only if R:R ≥ this
 T2_TIMEOUT_MS    = 10 * 60 * 1000   # 10 minutes in milliseconds
 MAX_ACCOUNT_RISK = 0.01   # 1% of account — combined T1+T2 max loss
+MIN_SNIPER_SCORE = 4      # with-trend T2 minimum score
+MIN_SNIPER_SCORE_COUNTER = 7 # counter-trend T2 minimum score
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,7 +220,11 @@ class BacktestResult:
     t2_wins:        int  = 0
     t2_losses:      int  = 0
     gate_funnel:    dict = field(default_factory=dict)
-    session_stats:  dict = field(default_factory=dict)
+    session_stats:  Dict[str, dict] = field(default_factory=dict)
+    
+    # Advanced reporting
+    bos_choch_events: List[Dict[str, Any]] = field(default_factory=list)
+    thresholds:       Dict[str, Any]       = field(default_factory=dict)
 
     def __str__(self) -> str:
         def _wr(w, t): return f"{w/t:.1%}" if t > 0 else "n/a"
@@ -346,6 +352,19 @@ class BacktestEngine:
 
         logger.info(f"[BacktestEngine] Starting run over {len(ticks_df):,} ticks")
 
+        bos_choch_list: List[dict] = []
+        # Capture current thresholds for reporting
+        thresholds = {
+            "T1_BUFFER_PIPS":    T1_BUFFER_PIPS,
+            "T2_BUFFER_PIPS":    T2_BUFFER_PIPS,
+            "P1_ATR_FACTOR":     P1_ATR_FACTOR,
+            "P2_ATR_FACTOR":     P2_ATR_FACTOR,
+            "MAX_ACCOUNT_RISK":  MAX_ACCOUNT_RISK,
+            "MIN_SNIPER_SCORE":  MIN_SNIPER_SCORE,
+            "MIN_SNIPER_SCORE_COUNTER": MIN_SNIPER_SCORE_COUNTER,
+            "T2_TIMEOUT_MS":     T2_TIMEOUT_MS,
+        }
+
         for _, row in ticks_df.iterrows():
             row_dict = dict(row)
             bid      = _safe_float(row_dict.get("bid"))  or 0.0
@@ -432,19 +451,20 @@ class BacktestEngine:
                     continue    # handled above
 
                 # SL hit
-                sl_hit = (
-                    (tstate.position == Position.LONG  and bid <= tstate.sl) or
-                    (tstate.position == Position.SHORT and ask >= tstate.sl)
-                )
-                if sl_hit:
-                    trade = self._close_trade(tstate, bid, ask, ts, "sl")
-                    trades.append(trade)
-                    equity_curve.append(equity_curve[-1] + trade.pnl)
-                    if tstate.type == "T1":
-                        # T2 recovery only if T1 stopped BEFORE Point 1 (real loss)
-                        self._t1_stopped_at_loss = (not tstate.point1_hit) and (trade.pnl < 0)
-                    to_remove.append(tid)
-                    continue
+                if tstate.sl is not None:
+                    sl_hit = (
+                        (tstate.position == Position.LONG  and bid <= tstate.sl) or
+                        (tstate.position == Position.SHORT and ask >= tstate.sl)
+                    )
+                    if sl_hit:
+                        trade = self._close_trade(tstate, bid, ask, ts, "sl")
+                        trades.append(trade)
+                        equity_curve.append(equity_curve[-1] + trade.pnl)
+                        if tstate.type == "T1":
+                            # T2 recovery only if T1 stopped BEFORE Point 1 (real loss)
+                            self._t1_stopped_at_loss = (not tstate.point1_hit) and (trade.pnl < 0)
+                        to_remove.append(tid)
+                        continue
 
                 # TP hit (T2 structural TP only — T1 has no TP)
                 if tstate.tp is not None:
@@ -460,20 +480,21 @@ class BacktestEngine:
                         continue
 
                 # Point 1 — move SL to breakeven (once only)
-                if not tstate.point1_hit:
+                if not tstate.point1_hit and tstate.point1_price is not None:
                     p1_hit = (
                         (tstate.position == Position.LONG  and bid >= tstate.point1_price) or
                         (tstate.position == Position.SHORT and ask <= tstate.point1_price)
                     )
                     if p1_hit:
                         tstate.point1_hit = True
-                        tstate.sl = tstate.entry_price   # move to breakeven
+                        if tstate.entry_price is not None:
+                            tstate.sl = tstate.entry_price   # move to breakeven
                         logger.debug(
                             f"[BacktestEngine] {tid} Point 1 hit — SL moved to BE @ {tstate.sl:.5f}"
                         )
 
                 # Point 2 — activate fractal trailing SL
-                if tstate.point1_hit and not tstate.point2_hit:
+                if tstate.point1_hit and not tstate.point2_hit and tstate.point2_price is not None:
                     p2_hit = (
                         (tstate.position == Position.LONG  and bid >= tstate.point2_price) or
                         (tstate.position == Position.SHORT and ask <= tstate.point2_price)
@@ -522,6 +543,20 @@ class BacktestEngine:
                 if reason.startswith("REASON_"):
                     gate_funnel[reason] = gate_funnel.get(reason, 0) + 1
 
+            # Track BOS/CHoCH events for the CSV/MD reports
+            if ctx.bos_detected_15m or ctx.choch_detected_15m:
+                event_type = "BOS" if ctx.bos_detected_15m else "CHoCH"
+                direction  = "bull" if (ctx.bos_up_15m or ctx.choch_up_15m) else "bear"
+                bos_choch_list.append({
+                    "timestamp": ts,
+                    "event":     event_type,
+                    "direction": direction,
+                    "session":   ctx.session or "off",
+                    "action":    action.value,
+                    "bid":       bid,
+                    "ask":       ask
+                })
+
             # Retrieve bar context for SL and Point calculations
             bar_high = _safe_float(row_dict.get("bar_high")) or mid
             bar_low  = _safe_float(row_dict.get("bar_low"))  or mid
@@ -535,6 +570,7 @@ class BacktestEngine:
             if action == Action.OPEN_T1_LONG and "T1" not in active_trades:
                 sl_price = self._calc_t1_sl(row_dict, Position.LONG)
                 if sl_price is None or atr_15m is None:
+                    print(f"DEBUG SL SKIP T1 LONG: sl={sl_price}, atr={atr_15m}")
                     logger.debug("[BacktestEngine] T1 long skipped: no sweep SL or ATR")
                 else:
                     lot = self._size_lot(ask, sl_price, current_equity, trade_type="T1")
@@ -558,6 +594,7 @@ class BacktestEngine:
             elif action == Action.OPEN_T1_SHORT and "T1" not in active_trades:
                 sl_price = self._calc_t1_sl(row_dict, Position.SHORT)
                 if sl_price is None or atr_15m is None:
+                    print(f"DEBUG SL SKIP T1 SHORT: sl={sl_price}, atr={atr_15m}")
                     logger.debug("[BacktestEngine] T1 short skipped: no sweep SL or ATR")
                 else:
                     lot = self._size_lot(bid, sl_price, current_equity, trade_type="T1")
@@ -669,7 +706,9 @@ class BacktestEngine:
                 trades.append(trade)
                 equity_curve.append(equity_curve[-1] + trade.pnl)
 
-        return self._compile_results(trades, len(ticks_df), equity_curve, gate_funnel)
+        return self._compile_results(
+            trades, len(ticks_df), equity_curve, gate_funnel, bos_choch_list, thresholds
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Trade helpers
@@ -770,15 +809,15 @@ class BacktestEngine:
         """
         buf = T1_BUFFER_PIPS * self.PIP_SIZE
         if direction == Position.LONG:
-            extreme = _safe_float(row_dict.get("sweep_candle_low"))
-            if extreme is None:
+            low = _safe_float(row_dict.get("sweep_candle_low"))
+            if low is None:
                 return None
-            return extreme - buf
+            return low - buf
         else:
-            extreme = _safe_float(row_dict.get("sweep_candle_high"))
-            if extreme is None:
+            high = _safe_float(row_dict.get("sweep_candle_high"))
+            if high is None:
                 return None
-            return extreme + buf
+            return high + buf
 
     def _find_structural_tp(
         self, state: TradeState, row_dict: dict
@@ -809,9 +848,9 @@ class BacktestEngine:
             val = _safe_float(row_dict.get(key))
             if val is None:
                 continue
-            if state.position == Position.LONG and val > entry:
+            if state.position == Position.LONG and entry is not None and val > entry:
                 candidates.append(val)
-            elif state.position == Position.SHORT and val < entry:
+            elif state.position == Position.SHORT and entry is not None and val < entry:
                 candidates.append(val)
 
         if not candidates:
@@ -940,15 +979,22 @@ class BacktestEngine:
 
     def _compile_results(
         self,
-        trades:      List[CompletedTrade],
-        total_ticks: int,
-        equity:      List[float],
-        gate_funnel: Dict[str, int],
+        trades:         List[CompletedTrade],
+        total_ticks:    int,
+        equity:         List[float],
+        gate_funnel:    Dict[str, int],
+        bos_choch_list: List[dict] = [],
+        thresholds:     dict       = {},
     ) -> BacktestResult:
         if not trades:
             return BacktestResult(
-                total_ticks, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                gate_funnel=gate_funnel,
+                total_ticks = total_ticks,
+                total_trades = 0, winning_trades = 0, losing_trades = 0,
+                gross_pnl = 0.0, win_rate = 0.0, avg_pnl_per_trade = 0.0,
+                max_drawdown = 0.0, profit_factor = 0.0, sharpe_ratio = 0.0,
+                gate_funnel = gate_funnel,
+                bos_choch_events = bos_choch_list,
+                thresholds = thresholds
             )
 
         wins       = [t for t in trades if t.pnl > 0]
@@ -992,7 +1038,90 @@ class BacktestEngine:
             t2_losses         = len([t for t in t2_trades if t.pnl <= 0]),
             session_stats     = session_stats,
             gate_funnel       = gate_funnel,
+            bos_choch_events  = bos_choch_list,
+            thresholds        = thresholds,
         )
+
+    # ── Report Export ────────────────────────────────────────────────────────
+    
+    def save_reports(self, result: BacktestResult, basename: str) -> None:
+        """Save both Markdown summary and Filtered CSV event log."""
+        from pathlib import Path
+        Path("reports").mkdir(exist_ok=True)
+        
+        md_path  = f"reports/{basename}.md"
+        csv_path = f"reports/{basename}_events.csv"
+        
+        self._write_markdown_report(result, md_path)
+        self._write_csv_report(result, csv_path)
+        
+        logger.info(f"[BacktestEngine] Reports saved to {md_path} and {csv_path}")
+
+    def _write_markdown_report(self, result: BacktestResult, path: str) -> None:
+        """Generates a premium Markdown summary of the backtest."""
+        lines = [
+            f"# Backtest Report: {self.symbol}",
+            f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "## Core Statistics",
+            "| Metric | Value |",
+            "| :--- | :--- |",
+            f"| **Total Trades** | {result.total_trades} |",
+            f"| **Win Rate** | {result.win_rate:.1%} |",
+            f"| **Gross PnL** | {result.gross_pnl:+.2f} |",
+            f"| **Profit Factor** | {result.profit_factor:.2f} |",
+            f"| **Sharpe Ratio** | {result.sharpe_ratio:.3f} |",
+            f"| **Max Drawdown** | {result.max_drawdown:.2f} |",
+            "",
+            "## Strategy Breakdown",
+            "| Phase | Trades | Wins | Losses | Win Rate |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ]
+        
+        t1_total = result.t1_wins + result.t1_losses
+        t1_wr = f"{result.t1_wins/t1_total:.1%}" if t1_total > 0 else "n/a"
+        lines.append(f"| T1 (Scout) | {t1_total} | {result.t1_wins} | {result.t1_losses} | {t1_wr} |")
+        
+        t2_total = result.t2_wins + result.t2_losses
+        t2_wr = f"{result.t2_wins/t2_total:.1%}" if t2_total > 0 else "n/a"
+        lines.append(f"| T2 (Sniper) | {t2_total} | {result.t2_wins} | {result.t2_losses} | {t2_wr} |")
+        
+        lines += [
+            "",
+            "## Current Setup (Thresholds)",
+            "| Parameter | Value |",
+            "| :--- | :--- |",
+        ]
+        for k, v in result.thresholds.items():
+            lines.append(f"| {k} | {v} |")
+        
+        lines += [
+            "",
+            "## BOS/CHoCH Detection Log",
+            "| Timestamp | Event | Direction | Session | Action Taken |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ]
+        # Show last 50 events to keep MD readable
+        events_to_show = list(result.bos_choch_events)[-50:]
+        for ev in events_to_show:
+            lines.append(
+                f"| {ev['timestamp']} | {ev['event']} | {ev['direction']} | {ev['session']} | {ev['action']} |"
+            )
+        
+        if len(result.bos_choch_events) > 50:
+            lines.append(f"\n*... showing last 50 of {len(result.bos_choch_events)} total events. Full log in CSV.*")
+
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+
+    def _write_csv_report(self, result: BacktestResult, path: str) -> None:
+        """Writes a filtered CSV containing only BOS/CHoCH event ticks."""
+        if not result.bos_choch_events:
+            logger.warning("[BacktestEngine] No events to write to CSV")
+            return
+            
+        df = pd.DataFrame(result.bos_choch_events)
+        df.to_csv(path, index=False)
 
     @staticmethod
     def _calc_max_drawdown(equity: List[float]) -> float:

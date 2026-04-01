@@ -131,6 +131,11 @@ class DuckDBStore:
                 is_swing_high_15m    BOOLEAN,
                 is_swing_low_15m     BOOLEAN,
                 market_bias_4h       VARCHAR,
+                -- Phase 2 SMC: Liquidity Sweep Features
+                sweep_candle_low     DOUBLE,
+                sweep_candle_high    DOUBLE,
+                sweep_wick           DOUBLE,
+                sweep_body           DOUBLE,
 
                 PRIMARY KEY (timestamp_utc, symbol, source)
             )
@@ -183,6 +188,11 @@ class DuckDBStore:
                 market_bias_4h       VARCHAR,
                 liq_swept            BOOLEAN,
                 liq_side             VARCHAR,
+                -- Phase 2 SMC: Liquidity Sweep Features
+                sweep_candle_low     DOUBLE,
+                sweep_candle_high    DOUBLE,
+                sweep_wick           DOUBLE,
+                sweep_body           DOUBLE,
 
                 PRIMARY KEY (tick_time, symbol)
             )
@@ -296,6 +306,10 @@ class DuckDBStore:
         self._add_column_if_not_exists("tick_features", "choch_down_15m", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "is_swing_high_15m", "BOOLEAN")
         self._add_column_if_not_exists("tick_features", "is_swing_low_15m", "BOOLEAN")
+        self._add_column_if_not_exists("tick_features", "sweep_candle_low", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "sweep_candle_high", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "sweep_wick", "DOUBLE")
+        self._add_column_if_not_exists("tick_features", "sweep_body", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "market_bias_4h", "VARCHAR")
 
         # candles_15m migrations
@@ -316,9 +330,21 @@ class DuckDBStore:
         self._add_column_if_not_exists("tick_features", "fvg_age_bars", "INTEGER")
 
         # trade_decisions migrations
+        self._add_column_if_not_exists("trade_decisions", "reason", "VARCHAR")
+        self._add_column_if_not_exists("trade_decisions", "score", "INTEGER")
         self._add_column_if_not_exists("trade_decisions", "fvg_filled", "BOOLEAN")
         self._add_column_if_not_exists("trade_decisions", "fvg_age_bars", "INTEGER")
         self._add_column_if_not_exists("trade_decisions", "fvg_timestamp", "TIMESTAMPTZ")
+        
+        # Phase 2 SMC + Liquidity for trade_decisions
+        self._add_column_if_not_exists("trade_decisions", "bos_up_15m", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "bos_down_15m", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "choch_up_15m", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "choch_down_15m", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "is_swing_high_15m", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "is_swing_low_15m", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "liq_swept", "BOOLEAN")
+        self._add_column_if_not_exists("trade_decisions", "liq_side", "VARCHAR")
 
     def _add_column_if_not_exists(self, table: str, column: str, dtype: str) -> None:
         """Helper to safely add a column to an existing table."""
