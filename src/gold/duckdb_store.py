@@ -312,6 +312,12 @@ class DuckDBStore:
         self._add_column_if_not_exists("tick_features", "sweep_body", "DOUBLE")
         self._add_column_if_not_exists("tick_features", "market_bias_4h", "VARCHAR")
 
+        # trade_decisions migrations — FIX: added missing sweep columns
+        self._add_column_if_not_exists("trade_decisions", "sweep_candle_low", "DOUBLE")
+        self._add_column_if_not_exists("trade_decisions", "sweep_candle_high", "DOUBLE")
+        self._add_column_if_not_exists("trade_decisions", "sweep_wick", "DOUBLE")
+        self._add_column_if_not_exists("trade_decisions", "sweep_body", "DOUBLE")
+
         # candles_15m migrations
         self._add_column_if_not_exists("candles_15m", "bos_up_15m", "BOOLEAN")
         self._add_column_if_not_exists("candles_15m", "bos_down_15m", "BOOLEAN")
@@ -417,7 +423,8 @@ class DuckDBStore:
             "smc_trend_15m", "hh_15m", "ll_15m", "strong_low_15m", "strong_high_15m",
             "bos_detected_15m", "choch_detected_15m", "market_bias_4h",
             "bos_up_15m", "bos_down_15m", "choch_up_15m", "choch_down_15m",
-            "is_swing_high_15m", "is_swing_low_15m"
+            "is_swing_high_15m", "is_swing_low_15m",
+            "sweep_candle_low", "sweep_candle_high", "sweep_wick", "sweep_body"
         ]
         # Only use columns that exist in the DataFrame
         available = [c for c in cols if c in df.columns]
@@ -468,7 +475,8 @@ class DuckDBStore:
             "bos_detected_15m", "choch_detected_15m", "market_bias_4h",
             "bos_up_15m", "bos_down_15m", "choch_up_15m", "choch_down_15m",
             "is_swing_high_15m", "is_swing_low_15m",
-            "liq_swept", "liq_side"
+            "liq_swept", "liq_side",
+            "sweep_candle_low", "sweep_candle_high", "sweep_wick", "sweep_body"
         ]
         # Ensure tick_time is a datetime object for DuckDB
         if isinstance(decision_data["tick_time"], str):

@@ -160,6 +160,13 @@ async def run_pipeline(
 
             fe = FeatureEngineer()
             enriched = fe.build_features(ticks_df)
+            
+            # TEMP DEBUG
+            print("DEBUG bos_detected_15m:", enriched.get("bos_detected_15m", pd.Series()).sum())
+            print("DEBUG sweep_candle_low non-null:", enriched["sweep_candle_low"].notna().sum() if "sweep_candle_low" in enriched.columns else "COLUMN MISSING")
+            print("DEBUG sweep_candle_high non-null:", enriched["sweep_candle_high"].notna().sum() if "sweep_candle_high" in enriched.columns else "COLUMN MISSING")
+            print("DEBUG fvg_high non-null:", enriched["fvg_high"].notna().sum() if "fvg_high" in enriched.columns else "COLUMN MISSING")
+            print("DEBUG market_bias_4h counts:", enriched["market_bias_4h"].value_counts().to_dict() if "market_bias_4h" in enriched.columns else "COLUMN MISSING")
 
             if not enriched.empty:
                 fe.save_to_duckdb(enriched, store)
@@ -223,13 +230,14 @@ async def run_pipeline(
         decisions_df = store._con.execute(f"""
             SELECT * FROM trade_decisions 
             WHERE symbol = '{symbol}'
+              AND decision != 'HOLD'
             ORDER BY tick_time ASC
         """).df()
         
         if not decisions_df.empty:
             decision_file = reports_dir / f"decisions_{symbol}_{start}_to_{end}.csv"
             decisions_df.to_csv(decision_file, index=False)
-            logger.info(f"[Report] Exported {len(decisions_df)} decisions (incl. HOLDS) to '{decision_file}'")
+            logger.info(f"[Report] Exported {len(decisions_df)} trade decisions (excluding HOLDS) to '{decision_file}'")
 
     # ── FINAL SUMMARY PREVIEW ─────────────────────────────────────────────────
     if not skip_backtest:

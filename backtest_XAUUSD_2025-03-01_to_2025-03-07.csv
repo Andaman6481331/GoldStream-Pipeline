@@ -1,2 +1,0 @@
-symbol,direction,entry_time,exit_time,entry_price,exit_price,pnl,pnl_pips,exit_reason
-XAUUSD,LONG,2025-03-05 22:30:00.048000+07:00,2025-03-05 22:30:40.213000+07:00,2918.525,2919.148,0.6230000000000473,6.230000000000473,trailing_stop

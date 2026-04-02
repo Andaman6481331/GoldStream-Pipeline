@@ -570,8 +570,9 @@ class BacktestEngine:
             if action == Action.OPEN_T1_LONG and "T1" not in active_trades:
                 sl_price = self._calc_t1_sl(row_dict, Position.LONG)
                 if sl_price is None or atr_15m is None:
-                    print(f"DEBUG SL SKIP T1 LONG: sl={sl_price}, atr={atr_15m}")
-                    logger.debug("[BacktestEngine] T1 long skipped: no sweep SL or ATR")
+                    # print(f"DEBUG SL SKIP T1 LONG: sl={sl_price}, atr={atr_15m}")
+                    # logger.debug("[BacktestEngine] T1 long skipped: no sweep SL or ATR")
+                    pass
                 else:
                     lot = self._size_lot(ask, sl_price, current_equity, trade_type="T1")
                     s1  = TradeState(type="T1", trade_pair_id=_pair_id,
@@ -594,8 +595,9 @@ class BacktestEngine:
             elif action == Action.OPEN_T1_SHORT and "T1" not in active_trades:
                 sl_price = self._calc_t1_sl(row_dict, Position.SHORT)
                 if sl_price is None or atr_15m is None:
-                    print(f"DEBUG SL SKIP T1 SHORT: sl={sl_price}, atr={atr_15m}")
-                    logger.debug("[BacktestEngine] T1 short skipped: no sweep SL or ATR")
+                    # print(f"DEBUG SL SKIP T1 SHORT: sl={sl_price}, atr={atr_15m}")
+                    # logger.debug("[BacktestEngine] T1 short skipped: no sweep SL or ATR")
+                    pass
                 else:
                     lot = self._size_lot(bid, sl_price, current_equity, trade_type="T1")
                     s1  = TradeState(type="T1", trade_pair_id=_pair_id,

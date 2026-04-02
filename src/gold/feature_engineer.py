@@ -208,6 +208,13 @@ class FeatureEngineer:
         self.swing_highs_15m, self.swing_lows_15m = self._build_swing_history_15m(
             self.candles_15m
         )
+
+        # TEMP DEBUG
+        print("DEBUG swing_highs:", len(self.swing_highs_15m), [s.price for s in self.swing_highs_15m[:3]])
+        print("DEBUG swing_lows:", len(self.swing_lows_15m), [s.price for s in self.swing_lows_15m[:3]])
+        print("DEBUG 15m candles shape:", self.candles_15m.shape)
+        print("DEBUG r_dynamic sample:", self.candles_15m["r_dynamic"].value_counts().to_dict() if "r_dynamic" in self.candles_15m.columns else "MISSING")
+        
         swing_count_df = self._build_swing_count_series(
             ticks_df, self.swing_highs_15m, self.swing_lows_15m
         )
@@ -241,15 +248,53 @@ class FeatureEngineer:
         enriched = self._merge_session_levels(enriched, session_levels_df)
         enriched = self._merge_swing_counts(enriched, swing_count_df)
         enriched = self._merge_smc_structure(enriched, structure_df, self.candles_4h)
+
+        # NEW — forward-fill BOS zone extremes from structure_df to all ticks
+        if not structure_df.empty:
+            bos_zone_cols = ["bar_time", "sweep_candle_low", "sweep_candle_high"]
+            available_bos_cols = [c for c in bos_zone_cols if c in structure_df.columns]
+            if len(available_bos_cols) > 1:
+                enriched = pd.merge_asof(
+                    enriched.sort_values("timestamp_utc"),
+                    structure_df[available_bos_cols]
+                        .dropna(subset=["sweep_candle_low", "sweep_candle_high"], how="all")
+                        .sort_values("bar_time"),
+                    left_on="timestamp_utc",
+                    right_on="bar_time",
+                    direction="backward",
+                    suffixes=("", "_bos_zone"),
+                ).drop(columns="bar_time", errors="ignore")
+                # Prefer BOS zone extreme over any previously merged sweep value
+                for col in ["sweep_candle_low", "sweep_candle_high"]:
+                    bos_col = f"{col}_bos_zone"
+                    if bos_col in enriched.columns:
+                        enriched[col] = enriched[bos_col].combine_first(
+                            enriched.get(col, pd.Series(dtype=float))
+                        )
+                        enriched.drop(columns=[bos_col], inplace=True)
+                    
         enriched = self._merge_fvg_smc(enriched, fvg_df, self.candles_1m)
 
+        # Merge candle-level sweep info — use suffixes to avoid collision with BOS zone columns
         enriched = pd.merge_asof(
             enriched.sort_values("timestamp_utc"),
             self.candles_1m[["bar_time", "liq_swept", "liq_side", "sweep_tier", 
                              "sweep_candle_low", "sweep_candle_high", 
                              "sweep_wick", "sweep_body"]].sort_values("bar_time"),
             left_on="timestamp_utc", right_on="bar_time", direction="backward",
+            suffixes=("", "_1m_sweep")
         ).drop(columns="bar_time", errors="ignore")
+
+        # Combine: prefer BOS zone extreme (already in the column) or fill from 1m candle sweep
+        for col in ["sweep_candle_low", "sweep_candle_high"]:
+            m_col = f"{col}_1m_sweep"
+            if m_col in enriched.columns:
+                # If the column doesn't exist yet (e.g. no BOS zone), initialized it
+                if col not in enriched.columns:
+                    enriched[col] = enriched[m_col]
+                else:
+                    enriched[col] = enriched[col].combine_first(enriched[m_col])
+                enriched.drop(columns=[m_col], inplace=True)
 
         # Step 11: Session label  (FIX #8/#16)
         enriched = self._add_session_label(enriched)
@@ -279,8 +324,8 @@ class FeatureEngineer:
             "bos_detected_15m", "choch_detected_15m",
             "bos_up_15m", "bos_down_15m", "choch_up_15m", "choch_down_15m",
             "is_swing_high_15m", "is_swing_low_15m",
-            "bos_time_ms",          # FIX #13: Gate 3 timing
-            "r_dynamic_at_bos",     # FIX #13: Gate 3 timing
+            "bos_time_ms",
+            "r_dynamic_at_bos",
             "market_bias_4h",
             "fvg_high", "fvg_low", "fvg_side", "fvg_filled", "fvg_age_bars",
             "session",
@@ -486,6 +531,8 @@ class FeatureEngineer:
         choch_dn_ev = [False] * n
         bos_time_ms_arr      = [None] * n   # FIX #13
         r_dyn_at_bos_arr     = [None] * n   # FIX #13
+        sweep_zone_low_arr   = [None] * n   # bull BOS: min(low) from strong_low → BOS
+        sweep_zone_high_arr  = [None] * n   # bear BOS: max(high) from strong_high → BOS
 
         all_swings = sorted(swing_highs + swing_lows, key=lambda s: s.bar_time)
         sw_idx = 0
@@ -528,73 +575,46 @@ class FeatureEngineer:
             # reversal signal on the same bar; the CHoCH can fire on the next bar
             # if price remains below strong_low.  (Review issue #7.)
 
-            if trend == "bull" or trend is None:
+            # if trend == "bull" or trend is None:
 
-                if hh is not None and curr_c > hh:
-                    # ── Bullish BOS ──────────────────────────────────────────
-                    if trend == "bull":
-                        bos_ev[i]    = True
-                        bos_up_ev[i] = True
-                        # FIX #6: update strong_low to the most recent confirmed SL
-                        # before this BOS bar (defines the new sweep zone floor)
-                        pre_lows = [sl for sl in swing_lows if sl.bar_time <= curr_t]
-                        if pre_lows:
-                            strong_low = pre_lows[-1].price
-                        # FIX #13: record bos_time and r_dynamic at this moment
-                        bos_time_ms_arr[i]  = int(curr_t.value // 1_000_000)
-                        r_dyn_at_bos_arr[i] = r_now
-                    trend = "bull"
+            if hh is not None and curr_c > hh:
+                # ── Bullish BOS ──────────────────────────────────────────
+                # Fire BOS whether trend is "bull" or None — first break
+                # establishes trend, second+ break confirms BOS continuation.
+                bos_ev[i]    = True
+                bos_up_ev[i] = True
+                pre_lows = [sl for sl in swing_lows if sl.bar_time <= curr_t]
+                if pre_lows:
+                    strong_low = pre_lows[-1].price
+                bos_time_ms_arr[i]  = int(curr_t.value // 1_000_000)
+                r_dyn_at_bos_arr[i] = r_now
+                # NEW — sweep zone low
+                if pre_lows:
+                    sl_time    = pre_lows[-1].bar_time
+                    sl_bar_idx = int(np.searchsorted(times, sl_time, side="left"))
+                    zone_lows  = candles["bar_low"].values[sl_bar_idx : i + 1]
+                    if len(zone_lows):
+                        sweep_zone_low_arr[i] = float(np.min(zone_lows))
+                trend = "bull"
 
-                elif strong_low is not None and curr_c < strong_low:
-                    # ── Bearish CHoCH (Bull -> Bear) ────────────────────────
-                    choch_ev[i]    = True
-                    choch_dn_ev[i] = True
-                    trend = "bear"
-                    ll    = None
-                    hh    = None
-                    strong_low = None
-                    pre_highs = [sh for sh in swing_highs if sh.bar_time < curr_t]
-                    strong_high = max(p.price for p in pre_highs) if pre_highs else None
-
-                elif trend is None and ll is not None and curr_c < ll:
-                    # ── Bearish Trend Establishment (None -> Bear) ──────────
-                    # FIX: allow initial bear trend without prior bull HH.
-                    trend = "bear"
-                    # No HH/LL reset needed yet, as we are entering from None.
-                    # Update strong_high to the most recent confirmed SH.
-                    pre_highs = [sh for sh in swing_highs if sh.bar_time <= curr_t]
-                    if pre_highs:
-                        strong_high = pre_highs[-1].price
-
-            elif trend == "bear":
-
-                if ll is not None and curr_c < ll:
-                    # ── Bearish BOS ──────────────────────────────────────────
-                    bos_ev[i]     = True
-                    bos_down_ev[i] = True
-                    # FIX #6: update strong_high to the most recent confirmed SH
-                    pre_highs = [sh for sh in swing_highs if sh.bar_time <= curr_t]
-                    if pre_highs:
-                        strong_high = pre_highs[-1].price
-                    # FIX #13
-                    bos_time_ms_arr[i]  = int(curr_t.value // 1_000_000)
-                    r_dyn_at_bos_arr[i] = r_now
-                    # FIX review-#3: do NOT advance ll = curr_c here.
-                    # ll only moves when the swing-consumption loop confirms a
-                    # new swing low.  Was ll = curr_c — same cascade problem
-                    # as the bullish BOS branch above.
-
-                elif strong_high is not None and curr_c > strong_high:
-                    # ── Bullish CHoCH ────────────────────────────────────────
-                    choch_ev[i]   = True
-                    choch_up_ev[i] = True
-                    trend = "bull"
-                    # FIX #7: hh = None, not curr_c
-                    hh    = None
-                    ll    = None
-                    strong_high = None
-                    pre_lows = [sl for sl in swing_lows if sl.bar_time < curr_t]
-                    strong_low = min(p.price for p in pre_lows) if pre_lows else None
+            # elif trend == "bear":
+            if ll is not None and curr_c < ll:
+                # ── Bearish BOS ──────────────────────────────────────────
+                bos_ev[i]      = True
+                bos_down_ev[i] = True
+                pre_highs = [sh for sh in swing_highs if sh.bar_time <= curr_t]
+                if pre_highs:
+                    strong_high = pre_highs[-1].price
+                bos_time_ms_arr[i]  = int(curr_t.value // 1_000_000)
+                r_dyn_at_bos_arr[i] = r_now
+                # NEW — sweep zone high: max(bar_high) from strong_high bar → BOS bar
+                if pre_highs:
+                    sh_time    = pre_highs[-1].bar_time
+                    sh_bar_idx = int(np.searchsorted(times, sh_time, side="left"))
+                    zone_highs = candles["bar_high"].values[sh_bar_idx : i + 1]
+                    if len(zone_highs):
+                        sweep_zone_high_arr[i] = float(np.max(zone_highs))
+                trend = "bear"
 
             trends[i]  = trend
             hhs[i]     = hh
@@ -622,8 +642,10 @@ class FeatureEngineer:
             "choch_down_15m":     choch_dn_ev,
             "is_swing_high_15m":  is_sh,
             "is_swing_low_15m":   is_sl,
-            "bos_time_ms":        bos_time_ms_arr,    # FIX #13
-            "r_dynamic_at_bos":   r_dyn_at_bos_arr,  # FIX #13
+            "bos_time_ms":        bos_time_ms_arr,
+            "r_dynamic_at_bos":   r_dyn_at_bos_arr,
+            "sweep_candle_low":   sweep_zone_low_arr,
+            "sweep_candle_high":  sweep_zone_high_arr,
         })
 
     # FIX #9/#12: requires HH+HL (bull) or LH+LL (bear) sequence.
