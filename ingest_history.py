@@ -205,22 +205,24 @@ async def run_pipeline(
                 symbol=symbol
             )
             result = engine.run(from_dt=start_dt, to_dt=end_dt)
-            # Result print will go to both terminal and backtest.log
+            
+            # Print full summary to console (and log)
+            print(result)
+            
+            # Save premium Markdown and CSV reports
+            engine.save_reports(result, f"summary_{symbol}_{start}_to_{end}")
             
             if result.trades:
+                export_file = reports_dir / f"backtest_{symbol}_{start}_to_{end}.csv"
+                # Keep the existing CSV export if needed, or rely on save_reports
+                # (save_reports exports events, not trades list)
                 trades_dict = []
                 for t in result.trades:
                     t_dict = t.__dict__.copy()
-                    # Convert Enums to strings for CSV compatibility
-                    if hasattr(t.direction, 'value'):
-                        t_dict['direction'] = t.direction.value
-                    else:
-                        t_dict['direction'] = str(t.direction)
+                    t_dict['direction'] = t.direction.value if hasattr(t.direction, 'value') else str(t.direction)
                     trades_dict.append(t_dict)
-                    
-                export_file = reports_dir / f"backtest_{symbol}_{start}_to_{end}.csv"
                 pd.DataFrame(trades_dict).to_csv(export_file, index=False)
-                logger.info(f"[Backtest] Exported {len(result.trades)} trades to '{export_file}'")
+                logger.info(f"[Backtest] Full trade details in '{export_file}'")
     else:
         logger.info("[Backtest] Skipping simulation (--skip-backtest flag set)")
 
@@ -265,7 +267,7 @@ async def run_pipeline(
             print(f" Backtest Executed Trades: {trades_count}")
             
             if sig_count > trades_count:
-                print(f" ⚠️  Potential Missed Ops : {sig_count - trades_count}")
+                print(f" [MISSING] Potential Missed Ops : {sig_count - trades_count}")
             
             if 'result' in locals():
                 print("-" * 50)

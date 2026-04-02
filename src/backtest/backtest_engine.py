@@ -145,6 +145,7 @@ class TradeState:
     entry_time:     Optional[datetime] = None
     entry_spread:   Optional[float] = None
     peak_price:     Optional[float] = None
+    adverse_price:  Optional[float] = None   # for MAE calculation
 
     # Entry candle extremes — for Point 1 calculation
     entry_candle_high: float = 0.0
@@ -198,6 +199,9 @@ class CompletedTrade:
     point2_hit:       bool
     hold_time_m:      float
     sl_pips_at_entry: float
+    mae_pips:         float
+    mfe_pips:         float
+    trend:            str        # "bull" | "bear"
 
 
 @dataclass
@@ -221,7 +225,21 @@ class BacktestResult:
     t2_losses:      int  = 0
     gate_funnel:    dict = field(default_factory=dict)
     session_stats:  Dict[str, dict] = field(default_factory=dict)
+    trend_stats:    Dict[str, dict] = field(default_factory=dict) # NEW: Breakdown by trend
+
+    # Unique event counts from full dataset
+    total_bos:      int = 0
+    total_choch:    int = 0
+    total_swing_highs: int = 0
+    total_swing_lows:  int = 0
+    total_fvgs:     int = 0
     
+    # Averages
+    avg_win:        float = 0.0
+    avg_loss:       float = 0.0
+    avg_mae_pips:   float = 0.0
+    avg_mfe_pips:   float = 0.0
+
     # Advanced reporting
     bos_choch_events: List[Dict[str, Any]] = field(default_factory=list)
     thresholds:       Dict[str, Any]       = field(default_factory=dict)
@@ -238,17 +256,16 @@ class BacktestResult:
             f"  Sharpe Ratio     : {self.sharpe_ratio:.3f}",
             f"  Max Drawdown     : {self.max_drawdown:.2f}",
             "",
+            "  DETECTION COUNTS",
+            "-" * 30,
+            f"  BOS / CHoCH      : {self.total_bos} / {self.total_choch}",
+            f"  Swings (H/L)     : {self.total_swing_highs} / {self.total_swing_lows}",
+            f"  Unique FVGs      : {self.total_fvgs}",
+            "",
             "  STRATEGY CATEGORIES",
             "-" * 30,
             f"  T1 (Scout)  : {self.t1_wins + self.t1_losses:3d} trd | WR: {_wr(self.t1_wins, self.t1_wins + self.t1_losses)}",
             f"  T2 (Sniper) : {self.t2_wins + self.t2_losses:3d} trd | WR: {_wr(self.t2_wins, self.t2_wins + self.t2_losses)}",
-            "",
-            "  T2 SNIPER FUNNEL (Rejections)",
-            "-" * 30,
-        ]
-        for reason, count in self.gate_funnel.items():
-            lines.append(f"  {reason:30s}: {count}")
-        lines += [
             "",
             "  SESSION PERFORMANCE",
             "-" * 30,
@@ -256,6 +273,13 @@ class BacktestResult:
         for sess, stats in self.session_stats.items():
             lines.append(
                 f"  {sess:10s}: {stats['total']:3d} trd | WR: {_wr(stats['wins'], stats['total'])}"
+            )
+        lines.append("")
+        lines.append("  TREND PERFORMANCE")
+        lines.append("-" * 30)
+        for trend, stats in self.trend_stats.items():
+            lines.append(
+                f"  {trend:10s}: {stats['total']:3d} trd | WR: {_wr(stats['wins'], stats['total'])}"
             )
         lines.append("=" * 60)
         return "\n".join(lines)
@@ -449,6 +473,14 @@ class BacktestEngine:
             for tid, tstate in active_trades.items():
                 if tstate.pending:
                     continue    # handled above
+
+                # Update peak/adverse prices for MAE/MFE
+                if tstate.position == Position.LONG:
+                    tstate.peak_price = max(tstate.peak_price, bid) if tstate.peak_price else bid
+                    tstate.adverse_price = min(tstate.adverse_price, bid) if tstate.adverse_price else bid
+                else:
+                    tstate.peak_price = min(tstate.peak_price, ask) if tstate.peak_price else ask
+                    tstate.adverse_price = max(tstate.adverse_price, ask) if tstate.adverse_price else ask
 
                 # SL hit
                 if tstate.sl is not None:
@@ -708,8 +740,18 @@ class BacktestEngine:
                 trades.append(trade)
                 equity_curve.append(equity_curve[-1] + trade.pnl)
 
+        # ── Summary Counts ──────────────────────────────────────────
+        counts = {
+            "bos":   int(ticks_df["bos_detected_15m"].sum()) if "bos_detected_15m" in ticks_df.columns else 0,
+            "choch": int(ticks_df["choch_detected_15m"].sum()) if "choch_detected_15m" in ticks_df.columns else 0,
+            "sh":    int(ticks_df["is_swing_high_15m"].sum()) if "is_swing_high_15m" in ticks_df.columns else 0,
+            "sl":    int(ticks_df["is_swing_low_15m"].sum()) if "is_swing_low_15m" in ticks_df.columns else 0,
+            "fvg":   int(ticks_df["fvg_timestamp"].nunique()) if "fvg_timestamp" in ticks_df.columns else 0,
+        }
+
         return self._compile_results(
-            trades, len(ticks_df), equity_curve, gate_funnel, bos_choch_list, thresholds
+            trades, len(ticks_df), equity_curve, gate_funnel, bos_choch_list, thresholds,
+            detection_counts = counts
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -942,6 +984,14 @@ class BacktestEngine:
         # Dollar PnL = price movement × lot size × pip value per lot / pip size
         pnl_dollar = pnl_pips * state.lot * self.LOT_PIP_VALUE
         hold_time  = (ts - state.entry_time).total_seconds() / 60.0
+        
+        # Calculate MAE and MFE in pips
+        if state.position == Position.LONG:
+            mfe_raw = (state.peak_price - state.entry_price) if state.peak_price else 0.0
+            mae_raw = (state.entry_price - state.adverse_price) if state.adverse_price else 0.0
+        else:
+            mfe_raw = (state.entry_price - state.peak_price) if state.peak_price else 0.0
+            mae_raw = (state.adverse_price - state.entry_price) if state.adverse_price else 0.0
 
         return CompletedTrade(
             symbol           = self.symbol,
@@ -963,6 +1013,9 @@ class BacktestEngine:
             point2_hit       = state.point2_hit,
             hold_time_m      = hold_time,
             sl_pips_at_entry = state.sl_pips,
+            mae_pips         = max(0.0, mae_raw / self.PIP_SIZE),
+            mfe_pips         = max(0.0, mfe_raw / self.PIP_SIZE),
+            trend            = state.bos_direction or "neutral"
         )
 
     def _is_wide_spread(self, spread: float) -> bool:
@@ -987,6 +1040,7 @@ class BacktestEngine:
         gate_funnel:    Dict[str, int],
         bos_choch_list: List[dict] = [],
         thresholds:     dict       = {},
+        detection_counts: dict     = {},
     ) -> BacktestResult:
         if not trades:
             return BacktestResult(
@@ -1016,8 +1070,21 @@ class BacktestEngine:
                 "wins":  len([t for t in s_trades if t.pnl > 0]),
             }
 
+        trend_stats: Dict[str, dict] = {}
+        for trend in ("bull", "bear"):
+            tr_trades = [t for t in trades if t.trend == trend]
+            trend_stats[trend] = {
+                "total": len(tr_trades),
+                "wins":  len([t for t in tr_trades if t.pnl > 0]),
+            }
+
         wr = len(wins) / len(trades)
         pf = (win_gross / abs(loss_gross)) if loss_gross < 0 else float("inf")
+
+        avg_win  = (win_gross / len(wins)) if wins else 0.0
+        avg_loss = (loss_gross / len(losses)) if losses else 0.0
+        avg_mae  = np.mean([t.mae_pips for t in trades]) if trades else 0.0
+        avg_mfe  = np.mean([t.mfe_pips for t in trades]) if trades else 0.0
 
         max_dd   = self._calc_max_drawdown(equity)
         sharpe   = self._calc_sharpe(trades)
@@ -1039,9 +1106,19 @@ class BacktestEngine:
             t2_wins           = len([t for t in t2_trades if t.pnl > 0]),
             t2_losses         = len([t for t in t2_trades if t.pnl <= 0]),
             session_stats     = session_stats,
+            trend_stats       = trend_stats,
             gate_funnel       = gate_funnel,
             bos_choch_events  = bos_choch_list,
             thresholds        = thresholds,
+            total_bos         = detection_counts.get("bos", 0),
+            total_choch       = detection_counts.get("choch", 0),
+            total_swing_highs = detection_counts.get("sh", 0),
+            total_swing_lows  = detection_counts.get("sl", 0),
+            total_fvgs        = detection_counts.get("fvg", 0),
+            avg_win           = avg_win,
+            avg_loss          = avg_loss,
+            avg_mae_pips      = avg_mae,
+            avg_mfe_pips      = avg_mfe,
         )
 
     # ── Report Export ────────────────────────────────────────────────────────
@@ -1065,17 +1142,58 @@ class BacktestEngine:
             f"# Backtest Report: {self.symbol}",
             f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
-            "## Core Statistics",
+            "## Core Performance",
             "| Metric | Value |",
             "| :--- | :--- |",
             f"| **Total Trades** | {result.total_trades} |",
             f"| **Win Rate** | {result.win_rate:.1%} |",
-            f"| **Gross PnL** | {result.gross_pnl:+.2f} |",
+            f"| **Net Profit ($)** | {result.gross_pnl:+.2f} |",
             f"| **Profit Factor** | {result.profit_factor:.2f} |",
             f"| **Sharpe Ratio** | {result.sharpe_ratio:.3f} |",
-            f"| **Max Drawdown** | {result.max_drawdown:.2f} |",
+            f"| **Max Drawdown ($)** | {result.max_drawdown:.2f} |",
             "",
-            "## Strategy Breakdown",
+            "## Trade Details",
+            "| Metric | Value |",
+            "| :--- | :--- |",
+            f"| **Average Win ($)** | {result.avg_win:+.2f} |",
+            f"| **Average Loss ($)** | {result.avg_loss:+.2f} |",
+            f"| **Average MAE (Pips)** | {result.avg_mae_pips:.1f} |",
+            f"| **Average MFE (Pips)** | {result.avg_mfe_pips:.1f} |",
+            "",
+            "## Market Event Counts (Full Data)",
+            "| Event | Count |",
+            "| :--- | :--- |",
+            f"| **Detected BOS** | {result.total_bos} |",
+            f"| **Detected CHoCH** | {result.total_choch} |",
+            f"| **Swing Highs** | {result.total_swing_highs} |",
+            f"| **Swing Lows** | {result.total_swing_lows} |",
+            f"| **Unique FVGs Formed** | {result.total_fvgs} |",
+            "",
+            "## Session Breakdown",
+            "| Session | Trades | Wins | Losses | Win Rate |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ]
+        
+        for sess, stats in result.session_stats.items():
+            wr = f"{stats['wins']/stats['total']:.1%}" if stats['total'] > 0 else "0.0%"
+            loss = stats['total'] - stats['wins']
+            lines.append(f"| {sess.capitalize()} | {stats['total']} | {stats['wins']} | {loss} | {wr} |")
+
+        lines += [
+            "",
+            "## Trend Breakdown",
+            "| Trend | Trades | Wins | Losses | Win Rate |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ]
+
+        for trend, stats in result.trend_stats.items():
+            wr = f"{stats['wins']/stats['total']:.1%}" if stats['total'] > 0 else "0.0%"
+            loss = stats['total'] - stats['wins']
+            lines.append(f"| {trend.capitalize()} | {stats['total']} | {stats['wins']} | {loss} | {wr} |")
+
+        lines += [
+            "",
+            "## Strategy Phase Breakdown",
             "| Phase | Trades | Wins | Losses | Win Rate |",
             "| :--- | :--- | :--- | :--- | :--- |",
         ]
@@ -1090,7 +1208,7 @@ class BacktestEngine:
         
         lines += [
             "",
-            "## Current Setup (Thresholds)",
+            "## Configuration (Thresholds)",
             "| Parameter | Value |",
             "| :--- | :--- |",
         ]
@@ -1099,7 +1217,7 @@ class BacktestEngine:
         
         lines += [
             "",
-            "## BOS/CHoCH Detection Log",
+            "## Event Log (Last 50 Samples)",
             "| Timestamp | Event | Direction | Session | Action Taken |",
             "| :--- | :--- | :--- | :--- | :--- |",
         ]
@@ -1109,6 +1227,9 @@ class BacktestEngine:
             lines.append(
                 f"| {ev['timestamp']} | {ev['event']} | {ev['direction']} | {ev['session']} | {ev['action']} |"
             )
+        
+        if len(result.bos_choch_events) > 50:
+            lines.append(f"\n*... showing last 50 of {len(result.bos_choch_events)} total events.*")
         
         if len(result.bos_choch_events) > 50:
             lines.append(f"\n*... showing last 50 of {len(result.bos_choch_events)} total events. Full log in CSV.*")
