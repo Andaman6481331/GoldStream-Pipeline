@@ -18,7 +18,7 @@ import asyncio
 import logging
 import sys
 import os
-from datetime import timedelta
+from datetime import timedelta, datetime
 from pathlib import Path
 
 # ── Ensure project root is on sys.path ───────────────────────────────────────
@@ -55,13 +55,41 @@ async def run_pipeline(
     skip_silver:   bool = False,
     skip_gold:     bool = False,
     skip_backtest: bool = False,
+    skip_audit:    bool = False,
+    limit_audit:   int  = 1000,
+    only_backtest: bool = False,
 ) -> None:
     """
     Full historical ingestion pipeline:
       1. Bronze  — Download .bi5 files → Parquet partitions
       2. Silver  — Validate + normalise to UnifiedTick via Pydantic
       3. Gold    — Compute RSI/ATR/Liquidity features, store to DuckDB
+      4. Audit   — Match intent against features (quietly to audit.log)
+      5. Backtest— High-fidelity simulation (to backtest.log)
     """
+
+    # ── LOGGING SETUP (File-Based) ────────────────────────────────────────────
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Configure Backtest and Audit specific file handlers
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s")
+    
+    audit_handler = logging.FileHandler(log_dir / "audit.log")
+    audit_handler.setFormatter(formatter)
+    logging.getLogger("src.bot.audit_logger").addHandler(audit_handler)
+    
+    backtest_handler = logging.FileHandler(log_dir / "backtest.log")
+    backtest_handler.setFormatter(formatter)
+    logging.getLogger("src.backtest.backtest_engine").addHandler(backtest_handler)
+
+    if only_backtest:
+        logger.info("[Pipeline] --only-backtest set: Skipping ingestion/feature/audit stages.")
+        skip_download = skip_silver = skip_gold = skip_audit = True
+
+    # Parse dates safely for range-bound tasks
+    start_dt = pd.to_datetime(start).tz_localize("UTC").to_pydatetime()
+    end_dt   = (pd.to_datetime(end).tz_localize("UTC") + timedelta(days=1) - timedelta(seconds=1)).to_pydatetime()
 
     # ── BRONZE ────────────────────────────────────────────────────────────────
     downloader = HistoryDownloader(
@@ -93,14 +121,18 @@ async def run_pipeline(
         downloader.merge_month(m.year, m.month)
 
     # ── SILVER ────────────────────────────────────────────────────────────────
-    logger.info("[Silver] Processing Parquet partitions → UnifiedTick")
-    processor = SilverProcessor()
-    unified_ticks = list(processor.process_all_parquets(bronze_dir, symbol=symbol, start_date=start, end_date=end))
-    logger.info(f"[Silver] Validated {len(unified_ticks):,} UnifiedTick rows")
+    unified_ticks = []
+    if not skip_silver:
+        logger.info("[Silver] Processing Parquet partitions → UnifiedTick")
+        processor = SilverProcessor()
+        unified_ticks = list(processor.process_all_parquets(bronze_dir, symbol=symbol, start_date=start, end_date=end))
+        logger.info(f"[Silver] Validated {len(unified_ticks):,} UnifiedTick rows")
 
-    if not unified_ticks:
-        logger.error("[Silver] No ticks produced — check bronze data and logs. Aborting.")
-        return
+        if not unified_ticks:
+            logger.error("[Silver] No ticks produced — check bronze data and logs. Aborting.")
+            return
+    else:
+        logger.info("[Silver] Skipping historical validation (--skip-silver or --only-backtest set)")
 
     # ── GOLD (DuckDB) ─────────────────────────────────────────────────────────
     logger.info("[Gold] Initialising DuckDB feature store")
@@ -142,20 +174,23 @@ async def run_pipeline(
         logger.info("[Gold] Running Scout & Sniper strategy engine...")
 
     # Run strategy after store is closed
-    await run_gold_layer(db_path=gold_db)
+    if not skip_audit:
+        logger.info(f"[Audit] Running intent engine ({start} → {end}) — Details in logs/audit.log")
+        await run_gold_layer(
+            db_path=gold_db,
+            from_dt=start_dt,
+            to_dt=end_dt,
+            limit=limit_audit if limit_audit > 0 else None
+        )
+    else:
+        logger.info("[Audit] Skipping intent engine (--skip-audit flag set)")
 
     # ── REPORTING & BACKTEST ──────────────────────────────────────────────────
     reports_dir = Path("reports")
     reports_dir.mkdir(exist_ok=True)
     
     if not skip_backtest:
-        logger.info(f"[Backtest] Executing simulation: {symbol} {start} → {end}")
-        
-        # Parse dates safely to UTC for BacktestEngine
-        # end_dt is set to end-of-day so --end is inclusive (e.g. --end 2024-01-08
-        # captures all ticks through 2024-01-08 23:59:59 UTC)
-        start_dt = pd.to_datetime(start).tz_localize("UTC").to_pydatetime()
-        end_dt   = (pd.to_datetime(end).tz_localize("UTC") + timedelta(days=1) - timedelta(seconds=1)).to_pydatetime()
+        logger.info(f"[Backtest] Executing simulation: {symbol} {start} → {end} — Details in logs/backtest.log")
         
         with DuckDBStore(db_path=gold_db, read_only=True) as store:
             engine = BacktestEngine(
@@ -163,7 +198,7 @@ async def run_pipeline(
                 symbol=symbol
             )
             result = engine.run(from_dt=start_dt, to_dt=end_dt)
-            print("\n" + str(result) + "\n")
+            # Result print will go to both terminal and backtest.log
             
             if result.trades:
                 trades_dict = []
@@ -196,6 +231,39 @@ async def run_pipeline(
             decisions_df.to_csv(decision_file, index=False)
             logger.info(f"[Report] Exported {len(decisions_df)} decisions (incl. HOLDS) to '{decision_file}'")
 
+    # ── FINAL SUMMARY PREVIEW ─────────────────────────────────────────────────
+    if not skip_backtest:
+        print("\n" + "="*50)
+        print(f" PIPELINE SUMMARY: {symbol} ({start} to {end})")
+        print("="*50)
+        
+        # Re-query briefly for comparison
+        with DuckDBStore(db_path=gold_db, read_only=True) as store:
+            stats = store._con.execute(f"""
+                SELECT 
+                    COUNT(*) FILTER (WHERE bos_detected_15m OR choch_detected_15m) as total_signals,
+                    (SELECT COUNT(*) FROM trade_decisions WHERE symbol = '{symbol}' AND decision != 'HOLD') as audit_actions
+                FROM tick_features
+                WHERE symbol = '{symbol}'
+                  AND timestamp_utc >= '{start_dt}' 
+                  AND timestamp_utc <= '{end_dt}'
+            """).fetchone() or (0, 0)
+            
+            sig_count, audit_count = stats
+            trades_count = len(result.trades) if 'result' in locals() else 0
+            
+            print(f" SMC Signals (BOS/CHoCH) : {sig_count}")
+            print(f" Audit Intent (non-HOLD) : {audit_count}")
+            print(f" Backtest Executed Trades: {trades_count}")
+            
+            if sig_count > trades_count:
+                print(f" ⚠️  Potential Missed Ops : {sig_count - trades_count}")
+            
+            if 'result' in locals():
+                print("-" * 50)
+                print(f" Net PnL: {result.gross_pnl:+.2f} | Win Rate: {result.win_rate:.1%}")
+        print("="*50 + "\n")
+
     logger.info("[Pipeline] Done.")
 
 
@@ -213,7 +281,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-download", action="store_true",  help="Skip Bronze download")
     parser.add_argument("--skip-silver",   action="store_true",  help="Skip Silver processing (load from DuckDB)")
     parser.add_argument("--skip-gold",     action="store_true",  help="Skip Gold processing (load from DuckDB)")
+    parser.add_argument("--skip-audit",    action="store_true",  help="Skip Audit intent phase")
     parser.add_argument("--skip-backtest", action="store_true",  help="Skip Backtest simulation")
+    parser.add_argument("--only-backtest", action="store_true",  help="Run ONLY the backtest on existing DB data")
+    parser.add_argument("--limit-audit",   type=int, default=0, help="Max ticks for Audit (0=unlimited, default)")
+
     return parser.parse_args()
 
 
@@ -229,4 +301,7 @@ if __name__ == "__main__":
             skip_silver   = args.skip_silver,
             skip_gold     = args.skip_gold,
             skip_backtest = args.skip_backtest,
+            skip_audit    = args.skip_audit,
+            limit_audit   = args.limit_audit,
+            only_backtest = args.only_backtest,
         ))

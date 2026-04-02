@@ -8,6 +8,8 @@ the result to trade_decisions in DuckDB.
 import logging
 import os
 import pandas as pd
+from datetime import datetime
+from typing import Optional
 from dotenv import load_dotenv
 
 from src.bot.strategy_scout_sniper import (
@@ -23,11 +25,18 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
+async def run_gold_layer(
+    db_path: str = "data/gold/goldstream.duckdb",
+    from_dt: Optional[datetime] = None,
+    to_dt:   Optional[datetime] = None,
+    limit:   Optional[int]      = 1000
+) -> None:
     """
     Main runner for the Gold layer using DuckDB.
     1. Connects to DuckDB.
     2. Queries unprocessed ticks from tick_features.
+       - If from_dt/to_dt is provided, restricts to that range.
+       - If from_dt is None, starts from the last audited tick (resume).
     3. Runs Scout & Sniper strategy.
     4. Persists all decisions to trade_decisions.
     """
@@ -35,6 +44,16 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
 
     try:
         with DuckDBStore(db_path=db_path) as store:
+            # ── 1. Determine Range & Persistence ──────────────────────────────
+            applied_from = from_dt
+            if applied_from is None:
+                # Resume logic: find the latest audited tick in the DB
+                last_tick = store._con.execute("SELECT MAX(tick_time) FROM trade_decisions").fetchone()[0]
+                if last_tick:
+                    applied_from = last_tick
+                    logger.info(f"[Audit] Resuming from last audited tick: {applied_from}")
+
+            # ── 2. Build Query ────────────────────────────────────────────────
             query = """
                 SELECT f.*
                 FROM tick_features f
@@ -44,10 +63,21 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                 WHERE t.tick_time IS NULL
                   AND f.atr_15_15m IS NOT NULL
                   AND (f.bos_detected_15m = TRUE OR f.choch_detected_15m = TRUE)
-                ORDER BY f.timestamp_utc ASC
-                LIMIT 1000
             """
-            rows_df = store._con.execute(query).df()
+            params = []
+            if applied_from:
+                query += " AND f.timestamp_utc >= ?"
+                params.append(applied_from)
+            if to_dt:
+                query += " AND f.timestamp_utc <= ?"
+                params.append(to_dt)
+            
+            query += " ORDER BY f.timestamp_utc ASC"
+            
+            if limit and limit > 0:
+                query += f" LIMIT {limit}"
+
+            rows_df = store._con.execute(query, params).df()
 
             if rows_df.empty:
                 logger.debug("No qualifying ticks to process")
@@ -200,7 +230,7 @@ async def run_gold_layer(db_path: str = "data/gold/goldstream.duckdb") -> None:
                 store.insert_trade_decision(decision_record)
                 saved += 1
 
-                logger.info(
+                logger.debug(
                     f"{'🎯' if action != Action.HOLD else '·'} "
                     f"{action.value:15s} | "
                     f"Reason={reason:25s} | "

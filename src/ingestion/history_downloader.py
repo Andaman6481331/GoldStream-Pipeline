@@ -47,9 +47,14 @@ DUKASCOPY_CDN  = "https://datafeed.dukascopy.com/datafeed"
 BI5_STRUCT_FMT = ">IIIff"
 BI5_ROW_SIZE   = struct.calcsize(BI5_STRUCT_FMT)   # 20 bytes
 
-# XAUUSD and all non-JPY instruments: integer encoding is × 100_000.
-# JPY pairs use × 1_000 — if you add JPY symbols, make this per-symbol.
-POINT_DIVISOR  = 100_000.0
+# Dukascopy encodes raw tick integers differently by instrument class:
+#   FX non-JPY (e.g. EURUSD):  integer = price × 100_000  (5 decimal places)
+#   Metals/CFDs (e.g. XAUUSD): integer = price × 1_000    (3 decimal places)
+#   JPY pairs (e.g. USDJPY):   integer = price × 1_000    (3 decimal places)
+# Using the wrong divisor produces prices ~100× too small (e.g. 45 instead of 4,500).
+FX_POINT_DIVISOR    = 100_000.0
+METAL_POINT_DIVISOR = 1_000.0
+METAL_SYMBOLS = {"XAUUSD", "XAGUSD", "XAUEUR", "XAGEUR", "XPTUSD", "XPDUSD"}
 
 # Dukascopy CDN requires a browser-like UA or returns 403/503 immediately.
 USER_AGENT = (
@@ -357,6 +362,11 @@ class HistoryDownloader:
         hour_epoch_ms = int(hour_dt.timestamp() * 1000)
         rows = []
 
+        # Select the correct divisor for this symbol:
+        #   metals/CFDs use 1,000  (3 dp)  — e.g. XAUUSD raw 4500000 → 4500.000
+        #   FX non-JPY  use 100,000 (5 dp) — e.g. EURUSD raw 108345  → 1.08345
+        divisor = METAL_POINT_DIVISOR if self.symbol in METAL_SYMBOLS else FX_POINT_DIVISOR
+
         for i in range(n_rows):
             offset = i * BI5_ROW_SIZE
             chunk  = decompressed[offset: offset + BI5_ROW_SIZE]
@@ -366,8 +376,8 @@ class HistoryDownloader:
                 BI5_STRUCT_FMT, chunk
             )
             ts_ms = hour_epoch_ms + delta_ms
-            ask   = ask_raw / POINT_DIVISOR   # 100_000 for XAUUSD
-            bid   = bid_raw / POINT_DIVISOR
+            ask   = ask_raw / divisor
+            bid   = bid_raw / divisor
             # Dukascopy volume is in millions of units — multiply to get real lots
             rows.append((
                 ts_ms,

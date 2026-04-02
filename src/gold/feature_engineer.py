@@ -544,26 +544,27 @@ class FeatureEngineer:
                         bos_time_ms_arr[i]  = int(curr_t.value // 1_000_000)
                         r_dyn_at_bos_arr[i] = r_now
                     trend = "bull"
-                    # FIX review-#3: do NOT advance hh = curr_c here.
-                    # hh should only move when a new confirmed swing high is
-                    # processed by the swing-consumption loop above.  Setting
-                    # hh = curr_c caused the very next close above curr_c to
-                    # fire another BOS without any new swing confirmation,
-                    # producing cascading BOS signals on consecutive 15m bars.
 
                 elif strong_low is not None and curr_c < strong_low:
-                    # ── Bearish CHoCH ────────────────────────────────────────
-                    choch_ev[i]  = True
+                    # ── Bearish CHoCH (Bull -> Bear) ────────────────────────
+                    choch_ev[i]    = True
                     choch_dn_ev[i] = True
                     trend = "bear"
-                    # FIX #7: set ll to None — wait for the next confirmed swing
-                    # low to establish LL.  Was: ll = curr_c (caused immediate
-                    # false bear BOS on the very next lower close).
                     ll    = None
                     hh    = None
                     strong_low = None
                     pre_highs = [sh for sh in swing_highs if sh.bar_time < curr_t]
                     strong_high = max(p.price for p in pre_highs) if pre_highs else None
+
+                elif trend is None and ll is not None and curr_c < ll:
+                    # ── Bearish Trend Establishment (None -> Bear) ──────────
+                    # FIX: allow initial bear trend without prior bull HH.
+                    trend = "bear"
+                    # No HH/LL reset needed yet, as we are entering from None.
+                    # Update strong_high to the most recent confirmed SH.
+                    pre_highs = [sh for sh in swing_highs if sh.bar_time <= curr_t]
+                    if pre_highs:
+                        strong_high = pre_highs[-1].price
 
             elif trend == "bear":
 

@@ -31,3 +31,5 @@ data/
 *.parquet
 
 tmp/
+data/gold/
+reports/
